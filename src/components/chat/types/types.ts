@@ -95,6 +95,28 @@ export interface PendingPermissionRequest {
   receivedAt?: Date;
 }
 
+export type ChatAutomationKind = 'goal' | 'loop';
+
+export type ChatAutomationState =
+  | 'starting'
+  | 'running'
+  | 'stopping'
+  | 'completed'
+  | 'stopped'
+  | 'failed';
+
+export interface ChatAutomation {
+  automationId: string;
+  kind: ChatAutomationKind;
+  state: ChatAutomationState;
+  command: string;
+  runtime: string;
+  startedAt: string;
+  updatedAt: string;
+  completedAt?: string | null;
+  error?: string | null;
+}
+
 export interface QuestionOption {
   label: string;
   description?: string;
@@ -121,7 +143,7 @@ export interface ChatInterfaceProps {
   selectedProject: Project | null;
   selectedSession: ProjectSession | null;
   ws: WebSocket | null;
-  sendMessage: (message: unknown) => void;
+  sendMessage: (message: unknown) => boolean;
   onFileOpen?: (filePath: string, diffInfo?: any) => void;
   onInputFocusChange?: (focused: boolean) => void;
   onSessionProcessing?: MarkSessionProcessing;

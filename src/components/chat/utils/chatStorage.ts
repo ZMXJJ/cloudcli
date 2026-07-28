@@ -41,7 +41,109 @@ export const safeLocalStorage = {
       console.error('localStorage removeItem error:', error);
     }
   },
+  keys: (): string[] => {
+    try {
+      return Object.keys(localStorage);
+    } catch (error) {
+      console.error('localStorage keys error:', error);
+      return [];
+    }
+  },
 };
+
+export type ChatDraftStorage = Pick<
+  typeof safeLocalStorage,
+  'getItem' | 'setItem' | 'removeItem'
+>;
+
+/** Pre-session project draft key used by older releases. */
+export const projectChatDraftKey = (projectId: string) => `draft_input_${projectId}`;
+export const newChatDraftKey = (projectId: string) => `draft_input_new_${projectId}`;
+export const sessionChatDraftKey = (sessionId: string) => `draft_input_session_${sessionId}`;
+
+export function getChatDraftStorageKey(projectId: string, sessionId?: string | null): string {
+  return sessionId ? sessionChatDraftKey(sessionId) : newChatDraftKey(projectId);
+}
+
+/**
+ * Restores a session-owned or New Chat draft. Legacy project-wide drafts are
+ * migrated only into New Chat; assigning one to an arbitrary existing session
+ * would steal a currently composed New Chat draft from older releases.
+ */
+export function readChatDraft(
+  projectId: string,
+  sessionId?: string | null,
+  storage: ChatDraftStorage = safeLocalStorage,
+): string {
+  const key = getChatDraftStorageKey(projectId, sessionId);
+  const current = storage.getItem(key);
+  if (current !== null) return current;
+  if (sessionId) return '';
+
+  const legacyKey = projectChatDraftKey(projectId);
+  const legacy = storage.getItem(legacyKey);
+  if (legacy === null) return '';
+  storage.setItem(key, legacy);
+  storage.removeItem(legacyKey);
+  return legacy;
+}
+
+/**
+ * Gives a newly allocated session its New Chat draft before navigation. The
+ * target is written from the in-memory value even if React has not flushed its
+ * persistence effect yet; a concurrently changed source draft is preserved.
+ */
+export function handoffChatDraft(
+  sourceKey: string | null | undefined,
+  targetKey: string,
+  content: string,
+  storage: ChatDraftStorage = safeLocalStorage,
+): void {
+  if (!sourceKey || sourceKey === targetKey) return;
+  writeChatDraft(targetKey, content, storage);
+  clearChatDraftIfUnchanged(sourceKey, content, storage);
+}
+
+export function isSubmittedChatDraftCurrent({
+  currentKey,
+  sourceKey,
+  targetKey,
+  currentContent,
+  submittedContent,
+}: {
+  currentKey: string | null | undefined;
+  sourceKey: string | null | undefined;
+  targetKey: string;
+  currentContent: string;
+  submittedContent: string;
+}): boolean {
+  return (
+    currentContent === submittedContent
+    && (currentKey === sourceKey || currentKey === targetKey)
+  );
+}
+
+export function writeChatDraft(
+  key: string,
+  content: string,
+  storage: ChatDraftStorage = safeLocalStorage,
+): void {
+  if (content) {
+    storage.setItem(key, content);
+  } else {
+    storage.removeItem(key);
+  }
+}
+
+export function clearChatDraftIfUnchanged(
+  key: string | null | undefined,
+  expectedContent: string,
+  storage: ChatDraftStorage = safeLocalStorage,
+): boolean {
+  if (!key || storage.getItem(key) !== expectedContent) return false;
+  storage.removeItem(key);
+  return true;
+}
 
 /**
  * Composer options captured when a message is queued, so the message can be

@@ -53,6 +53,7 @@ export class ChatSessionWriter {
   isWebSocketWriter = true;
 
   private readonly options: ChatSessionWriterOptions;
+  private readonly connections = new Set<RealtimeClientConnection>();
   /**
    * The provider-native session id as the runtime knows it. Kept locally
    * (besides the registry) because runtimes read it back via `getSessionId()`
@@ -64,6 +65,7 @@ export class ChatSessionWriter {
   constructor(options: ChatSessionWriterOptions) {
     this.options = options;
     this.ws = options.connection;
+    this.connections.add(options.connection);
     this.userId = options.userId;
     this.providerSessionId = options.providerSessionId;
   }
@@ -118,6 +120,7 @@ export class ChatSessionWriter {
 
   updateWebSocket(newConnection: RealtimeClientConnection): void {
     this.ws = newConnection;
+    this.connections.add(newConnection);
   }
 
   setSessionId(sessionId: string): void {
@@ -138,8 +141,13 @@ export class ChatSessionWriter {
   }
 
   private forward(message: NormalizedMessage): void {
-    if (this.ws.readyState === WS_OPEN_STATE) {
-      this.ws.send(JSON.stringify(message));
+    const payload = JSON.stringify(message);
+    for (const connection of this.connections) {
+      if (connection.readyState === WS_OPEN_STATE) {
+        connection.send(payload);
+      } else {
+        this.connections.delete(connection);
+      }
     }
   }
 }

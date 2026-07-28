@@ -63,9 +63,40 @@ test('live events are remapped to the app session id and sequenced', async () =>
 
     assert.equal(connection.frames.length, 2);
     assert.equal(connection.frames[0]?.sessionId, 'app-run-1');
+    assert.equal(connection.frames[0]?.runId, run.runId);
     assert.equal(connection.frames[0]?.seq, 1);
     assert.equal(connection.frames[1]?.sessionId, 'app-run-1');
     assert.equal(connection.frames[1]?.seq, 2);
+  });
+});
+
+test('a replacement run gets an independent replay generation and sequence', async () => {
+  await withIsolatedDatabase(() => {
+    sessionsDb.createAppSession('app-run-generation', 'claude', '/workspace/demo');
+    const connection = new FakeConnection();
+    const first = chatRunRegistry.startRun({
+      appSessionId: 'app-run-generation',
+      provider: 'claude',
+      providerSessionId: null,
+      connection,
+      userId: null,
+    });
+    assert.ok(first);
+    first.writer.send({ kind: 'complete', provider: 'claude', sessionId: 'native', exitCode: 0 });
+
+    const second = chatRunRegistry.startRun({
+      appSessionId: 'app-run-generation',
+      provider: 'claude',
+      providerSessionId: null,
+      connection,
+      userId: null,
+    });
+    assert.ok(second);
+    second.writer.send({ kind: 'text', provider: 'claude', sessionId: 'native', content: 'next run' });
+
+    assert.notEqual(second.runId, first.runId);
+    assert.equal(connection.frames.at(-1)?.runId, second.runId);
+    assert.equal(connection.frames.at(-1)?.seq, 1);
   });
 });
 
@@ -117,15 +148,51 @@ test('complete marks the run finished and duplicate completes are dropped', asyn
     run.writer.send({ kind: 'complete', provider: 'codex', sessionId: 'native-3', exitCode: 0 });
     // Late duplicate from a killed runtime's exit handler.
     run.writer.send({ kind: 'complete', provider: 'codex', sessionId: 'native-3', exitCode: 1 });
+    run.writer.send({ kind: 'text', provider: 'codex', sessionId: 'native-3', content: 'late output' });
 
     const completes = connection.frames.filter((frame) => frame.kind === 'complete');
     assert.equal(completes.length, 1);
+    assert.equal(connection.frames.some((frame) => frame.content === 'late output'), false);
     assert.equal(completes[0]?.actualSessionId, 'app-run-3');
     assert.equal(chatRunRegistry.isProcessing('app-run-3'), false);
 
     // completeRun is also a no-op once the run already completed.
     chatRunRegistry.completeRun('app-run-3', { exitCode: 1 });
     assert.equal(connection.frames.filter((frame) => frame.kind === 'complete').length, 1);
+  });
+});
+
+test('a replaced run cannot overwrite the current provider session mapping', async () => {
+  await withIsolatedDatabase(() => {
+    sessionsDb.createAppSession('app-run-provider-race', 'claude', '/workspace/demo');
+    const connection = new FakeConnection();
+    const first = chatRunRegistry.startRun({
+      appSessionId: 'app-run-provider-race',
+      provider: 'claude',
+      providerSessionId: null,
+      connection,
+      userId: null,
+    });
+    assert.ok(first);
+    first.writer.send({ kind: 'complete', provider: 'claude', sessionId: null, exitCode: 0 });
+
+    const second = chatRunRegistry.startRun({
+      appSessionId: 'app-run-provider-race',
+      provider: 'claude',
+      providerSessionId: null,
+      connection,
+      userId: null,
+    });
+    assert.ok(second);
+    second.writer.setSessionId('current-provider-session');
+    first.writer.setSessionId('stale-provider-session');
+
+    assert.equal(second.providerSessionId, 'current-provider-session');
+    assert.equal(first.providerSessionId, null);
+    assert.equal(
+      sessionsDb.getSessionById('app-run-provider-race')?.provider_session_id,
+      'current-provider-session',
+    );
   });
 });
 
@@ -222,7 +289,7 @@ test('replayEvents returns only events after the requested seq', async () => {
   });
 });
 
-test('attachConnection reroutes the live stream to a new socket', async () => {
+test('attachConnection broadcasts the live stream to every subscribed socket', async () => {
   await withIsolatedDatabase(() => {
     sessionsDb.createAppSession('app-run-5', 'opencode', '/workspace/demo');
     const firstConnection = new FakeConnection();
@@ -241,8 +308,33 @@ test('attachConnection reroutes the live stream to a new socket', async () => {
     assert.equal(chatRunRegistry.attachConnection('app-run-5', secondConnection), true);
     run.writer.send({ kind: 'stream_delta', provider: 'opencode', sessionId: 'o', content: 'after' });
 
-    assert.deepEqual(firstConnection.frames.map((frame) => frame.content), ['before']);
+    assert.deepEqual(firstConnection.frames.map((frame) => frame.content), ['before', 'after']);
     assert.deepEqual(secondConnection.frames.map((frame) => frame.content), ['after']);
+  });
+});
+
+test('attachConnection deduplicates a socket and drops closed subscribers', async () => {
+  await withIsolatedDatabase(() => {
+    sessionsDb.createAppSession('app-run-multi', 'claude', '/workspace/demo');
+    const firstConnection = new FakeConnection();
+    const run = chatRunRegistry.startRun({
+      appSessionId: 'app-run-multi',
+      provider: 'claude',
+      providerSessionId: null,
+      connection: firstConnection,
+      userId: null,
+    });
+    assert.ok(run);
+
+    assert.equal(chatRunRegistry.attachConnection('app-run-multi', firstConnection), true);
+    const secondConnection = new FakeConnection();
+    assert.equal(chatRunRegistry.attachConnection('app-run-multi', secondConnection), true);
+    firstConnection.readyState = 3;
+
+    run.writer.send({ kind: 'complete', provider: 'claude', sessionId: 'native', exitCode: 0 });
+
+    assert.equal(firstConnection.frames.length, 0);
+    assert.equal(secondConnection.frames.filter((frame) => frame.kind === 'complete').length, 1);
   });
 });
 

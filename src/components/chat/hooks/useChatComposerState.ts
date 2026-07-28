@@ -15,13 +15,20 @@ import { authenticatedFetch } from '../../../utils/api';
 import type { MarkSessionProcessing } from '../../../hooks/useSessionProtection';
 import { grantClaudeToolPermission } from '../utils/chatPermissions';
 import {
+  clearChatDraftIfUnchanged,
   clearQueuedMessage,
+  getChatDraftStorageKey,
+  handoffChatDraft,
+  isSubmittedChatDraftCurrent,
+  readChatDraft,
   readQueuedMessage,
   safeLocalStorage,
+  writeChatDraft,
   writeQueuedMessage,
   type QueuedSendOptions,
 } from '../utils/chatStorage';
 import type {
+  ChatAutomation,
   ChatMessage,
   PendingPermissionRequest,
   PermissionMode,
@@ -29,6 +36,22 @@ import type {
 } from '../types/types';
 import type { Project, ProjectSession, LLMProvider, ProviderModelsCacheInfo } from '../../../types/app';
 import { escapeRegExp } from '../utils/chatFormatting';
+import { readAutomationCommand } from '../utils/automationCommands';
+import {
+  consumeAutomationCommandState,
+  consumeAutomationInputAck,
+  consumeChatRequestRejection,
+  getActiveAutomationGeneration,
+  hasPendingLoopInput,
+  isPendingLoopInputStorageKey,
+  mergeRejectedPendingContent,
+  persistPendingLoopInput,
+  readPendingLoopInputs,
+  removePendingLoopInput,
+  retryPendingLoopInputs,
+  toPendingChatRequestResult,
+  type PendingChatRequestResult,
+} from '../utils/pendingChatRequests';
 
 import { useFileMentions } from './useFileMentions';
 import { type SlashCommand, useSlashCommands } from './useSlashCommands';
@@ -46,10 +69,11 @@ interface UseChatComposerStateArgs {
   codexModel: string;
   currentProviderEffort: string;
   opencodeModel: string;
+  automation: ChatAutomation | null;
   isLoading: boolean;
   canAbortSession: boolean;
   tokenBudget: Record<string, unknown> | null;
-  sendMessage: (message: unknown) => void;
+  sendMessage: (message: unknown) => boolean;
   sendByCtrlEnter?: boolean;
   onSessionProcessing?: MarkSessionProcessing;
   /**
@@ -65,6 +89,7 @@ interface UseChatComposerStateArgs {
   onShowSettings?: () => void;
   scrollToBottom: () => void;
   addMessage: (msg: ChatMessage) => void;
+  addMessageToSession: (sessionId: string, msg: ChatMessage) => void;
   setIsUserScrolledUp: (isScrolledUp: boolean) => void;
   setPendingPermissionRequests: Dispatch<SetStateAction<PendingPermissionRequest[]>>;
 }
@@ -161,6 +186,13 @@ export type QueuedDraft = {
   options?: QueuedSendOptions;
 };
 
+const createChatRequestId = (): string => {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `chat_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+};
+
 const restoreQueuedDraft = (sessionKey: string): QueuedDraft | null => {
   const saved = readQueuedMessage(sessionKey);
   // Image attachments can't survive a reload; only text and options persist.
@@ -198,6 +230,7 @@ export function useChatComposerState({
   codexModel,
   currentProviderEffort,
   opencodeModel,
+  automation,
   isLoading,
   canAbortSession,
   tokenBudget,
@@ -210,14 +243,16 @@ export function useChatComposerState({
   onShowSettings,
   scrollToBottom,
   addMessage,
+  addMessageToSession,
   setIsUserScrolledUp,
   setPendingPermissionRequests,
 }: UseChatComposerStateArgs) {
   const [input, setInput] = useState(() => {
     if (typeof window !== 'undefined' && selectedProject) {
-      // Draft inputs are keyed by the DB projectId so per-project drafts
-      // survive display-name changes.
-      return safeLocalStorage.getItem(`draft_input_${selectedProject.projectId}`) || '';
+      return readChatDraft(
+        selectedProject.projectId,
+        selectedSession?.id || currentSessionId || null,
+      );
     }
     return '';
   });
@@ -240,6 +275,10 @@ export function useChatComposerState({
   // to currentSessionId for a just-established session that hasn't been
   // handed back to the parent's `selectedSession` prop yet.
   const sessionKey = selectedSession?.id || currentSessionId || null;
+  const draftStorageKey = selectedProjectId
+    ? getChatDraftStorageKey(selectedProjectId, sessionKey)
+    : null;
+  const draftStorageKeyRef = useRef<string | null>(draftStorageKey);
 
   const [queuedDraft, setQueuedDraft] = useState<QueuedDraft | null>(() => {
     if (typeof window === 'undefined' || !sessionKey) {
@@ -252,6 +291,110 @@ export function useChatComposerState({
   // while `queuedDraft` still holds the old session's draft; the persistence
   // effect must not write across that gap.
   const queuedDraftSessionRef = useRef<string | null>(sessionKey);
+  const [initialPendingLoopInputs] = useState(readPendingLoopInputs);
+  const pendingChatRequestsRef = useRef(initialPendingLoopInputs);
+
+  const handleAutomationInputAck = useCallback((
+    responseSessionId: string,
+    requestId: string,
+    automationId: string,
+  ): PendingChatRequestResult => {
+    const pending = consumeAutomationInputAck(
+      pendingChatRequestsRef.current,
+      responseSessionId,
+      requestId,
+      automationId,
+    );
+    if (!pending) return toPendingChatRequestResult(null);
+    removePendingLoopInput(pending);
+    if (pending.localMessage) {
+      addMessageToSession(responseSessionId, pending.localMessage);
+    }
+    return toPendingChatRequestResult(pending);
+  }, [addMessageToSession]);
+
+  const handleChatRequestRejected = useCallback((
+    responseSessionId: string,
+    requestId: string,
+    automationId?: string | null,
+  ): PendingChatRequestResult => {
+    const pending = consumeChatRequestRejection(
+      pendingChatRequestsRef.current,
+      responseSessionId,
+      requestId,
+      automationId,
+    );
+    if (!pending) return toPendingChatRequestResult(null);
+    removePendingLoopInput(pending);
+    const ownsCurrentDraft = pending.draftStorageKey
+      ? draftStorageKeyRef.current === pending.draftStorageKey
+      : sessionKey === responseSessionId;
+    if (ownsCurrentDraft && inputValueRef.current !== pending.content) {
+      const currentDraft = inputValueRef.current;
+      const restored = mergeRejectedPendingContent(pending.content, currentDraft);
+      setInput(restored);
+      inputValueRef.current = restored;
+      if (pending.draftStorageKey) writeChatDraft(pending.draftStorageKey, restored);
+    } else if (pending.draftStorageKey && !ownsCurrentDraft) {
+      const storedDraft = safeLocalStorage.getItem(pending.draftStorageKey) || '';
+      writeChatDraft(
+        pending.draftStorageKey,
+        mergeRejectedPendingContent(pending.content, storedDraft),
+      );
+    }
+
+    return toPendingChatRequestResult(pending);
+  }, [sessionKey]);
+
+  const handleChatRunComplete = useCallback((responseSessionId: string): void => {
+    for (const [requestId, pending] of pendingChatRequestsRef.current) {
+      if (
+        pending.sessionId === responseSessionId
+        && pending.markedProcessing
+        && !pending.clearInputOnAck
+      ) {
+        pendingChatRequestsRef.current.delete(requestId);
+      }
+    }
+  }, []);
+
+  const handleAutomationCommandObserved = useCallback((
+    responseSessionId: string,
+    requestId: string,
+  ): void => {
+    consumeAutomationCommandState(
+      pendingChatRequestsRef.current,
+      responseSessionId,
+      requestId,
+    );
+  }, []);
+
+  const hasPendingAutomationInput = useCallback((responseSessionId: string): boolean => {
+    return hasPendingLoopInput(pendingChatRequestsRef.current, responseSessionId);
+  }, []);
+
+  const retryPendingAutomationInputs = useCallback((): string[] => {
+    return retryPendingLoopInputs(pendingChatRequestsRef.current, sendMessage);
+  }, [sendMessage]);
+
+  useEffect(() => {
+    const handlePendingInputStorage = (event: StorageEvent) => {
+      if (!isPendingLoopInputStorageKey(event.key) || event.newValue === null) return;
+      const shared = readPendingLoopInputs();
+      const discovered = new Map();
+      for (const [requestId, request] of shared) {
+        if (pendingChatRequestsRef.current.has(requestId)) continue;
+        pendingChatRequestsRef.current.set(requestId, request);
+        discovered.set(requestId, request);
+      }
+      for (const responseSessionId of retryPendingLoopInputs(discovered, sendMessage)) {
+        onSessionProcessing?.(responseSessionId, { statusText: null, canInterrupt: true });
+      }
+    };
+
+    window.addEventListener('storage', handlePendingInputStorage);
+    return () => window.removeEventListener('storage', handlePendingInputStorage);
+  }, [onSessionProcessing, sendMessage]);
 
   const handleBuiltInCommand = useCallback(
     (result: CommandExecutionResult) => {
@@ -649,14 +792,56 @@ export function useChatComposerState({
     ) => {
       event.preventDefault();
       const currentInput = inputValueRef.current;
+      const submittedDraftStorageKey = draftStorageKeyRef.current;
       if (!currentInput.trim() || !selectedProject) {
+        return;
+      }
+
+      const automationCommand = provider === 'claude'
+        ? readAutomationCommand(currentInput)
+        : null;
+      const automationGenerationClaim = getActiveAutomationGeneration(automation);
+      const isRunningLoopInputIntent = Boolean(
+        provider === 'claude'
+        && automation?.kind === 'loop'
+        && automation.state === 'running'
+        && !automationCommand,
+      );
+      const isActiveGoalStop = Boolean(
+        automationCommand?.kind === 'goal'
+        && automationCommand.action === 'stop'
+        && automation?.kind === 'goal'
+        && automationGenerationClaim,
+      );
+
+      if (automationCommand?.action === 'start' && attachedImages.length > 0) {
+        addMessage({
+          type: 'error',
+          content: 'Goal and Loop commands do not support image attachments.',
+          timestamp: new Date(),
+        });
+        return;
+      }
+      if (isRunningLoopInputIntent && attachedImages.length > 0) {
+        addMessage({
+          type: 'error',
+          content: 'Messages sent to a running Loop do not support image attachments.',
+          timestamp: new Date(),
+        });
+        return;
+      }
+
+      const sessionHasPendingLoopInput = sessionKey
+        ? hasPendingLoopInput(pendingChatRequestsRef.current, sessionKey)
+        : false;
+      if (sessionHasPendingLoopInput) {
         return;
       }
 
       // A turn is already in flight: stash this message instead of sending it.
       // It's auto-flushed (re-running this same function) once the turn ends,
       // so it still goes through slash-command interception, image upload, etc.
-      if (isLoading) {
+      if (isLoading && !isActiveGoalStop) {
         queuedDraftSessionRef.current = sessionKey;
         setQueuedDraft({
           content: currentInput,
@@ -673,8 +858,9 @@ export function useChatComposerState({
         if (textareaRef.current) {
           textareaRef.current.style.height = 'auto';
         }
-        // selectedProject is guaranteed by the guard at the top of handleSubmit.
-        safeLocalStorage.removeItem(`draft_input_${selectedProject.projectId}`);
+        if (submittedDraftStorageKey) {
+          safeLocalStorage.removeItem(submittedDraftStorageKey);
+        }
         return;
       }
 
@@ -697,7 +883,7 @@ export function useChatComposerState({
                 metadata: { type: 'builtin' },
               } as SlashCommand)
             : undefined);
-        if (matchedCommand && matchedCommand.type !== 'skill') {
+        if (matchedCommand && matchedCommand.type !== 'skill' && matchedCommand.type !== 'passthrough') {
           executeCommand(matchedCommand, isHelpAlias ? '/help' : commandInput);
           setInput('');
           inputValueRef.current = '';
@@ -789,6 +975,16 @@ export function useChatComposerState({
           return;
         }
 
+        const establishedDraftStorageKey = getChatDraftStorageKey(
+          selectedProject.projectId,
+          targetSessionId,
+        );
+        handoffChatDraft(
+          submittedDraftStorageKey,
+          establishedDraftStorageKey,
+          currentInput,
+        );
+
         onSessionEstablished?.(targetSessionId, {
           provider,
           project: selectedProject,
@@ -802,49 +998,135 @@ export function useChatComposerState({
         images: uploadedImages as any,
         timestamp: new Date(),
       };
-
-      addMessage(userMessage);
-      // Mark this request as processing in the per-session activity map (the
-      // single source of truth the indicator derives from). The id is always
-      // concrete at this point — no pending placeholder exists anymore.
-      onSessionProcessing?.(targetSessionId, {
-        statusText: null,
-        canInterrupt: true,
-      });
-
-      setIsUserScrolledUp(false);
-      setTimeout(() => scrollToBottom(), 100);
+      const isLoopInput = Boolean(
+        isRunningLoopInputIntent,
+      );
+      const isDetachedAutomationCommand = Boolean(
+        provider === 'claude'
+        && automationCommand
+        && (
+          automationCommand.kind === 'loop'
+          || automationCommand.action === 'status'
+          || automationCommand.action === 'stop'
+          || Boolean(automationGenerationClaim)
+        ),
+      );
+      const markedProcessing = isLoopInput || !isDetachedAutomationCommand;
+      const requestId = createChatRequestId();
+      const targetDraftStorageKey = getChatDraftStorageKey(
+        selectedProject.projectId,
+        targetSessionId,
+      );
+      const pendingRequest = {
+        requestId,
+        sessionId: targetSessionId,
+        content: messageContent,
+        markedProcessing,
+        clearInputOnAck: isLoopInput,
+        automationId: automationGenerationClaim,
+        draftStorageKey: isLoopInput ? targetDraftStorageKey : null,
+        localMessage: isLoopInput ? userMessage : null,
+      };
+      pendingChatRequestsRef.current.set(requestId, pendingRequest);
+      if (isLoopInput) {
+        persistPendingLoopInput(pendingRequest);
+      }
 
       // One message shape for every provider. The backend resolves the
       // provider, project path, and provider-native resume id from the
       // session row; `options` only carries composer-level preferences.
-      sendMessage({
+      const sent = sendMessage({
         type: 'chat.send',
         sessionId: targetSessionId,
+        requestId,
+        automationId: automationGenerationClaim ?? undefined,
         content: messageContent,
         options: {
           ...buildSendOptions(messageContent),
           images: uploadedImages,
         },
       });
-
-      setInput('');
-      inputValueRef.current = '';
-      resetCommandMenuState();
-      setAttachedImages([]);
-      setUploadingImages(new Map());
-      setImageErrors(new Map());
-      setIsTextareaExpanded(false);
-
-      if (textareaRef.current) {
-        textareaRef.current.style.height = 'auto';
+      if (!sent) {
+        pendingChatRequestsRef.current.delete(requestId);
+        if (isLoopInput) removePendingLoopInput(pendingRequest);
+        addMessageToSession(targetSessionId, {
+          type: 'error',
+          content: 'WebSocket is not connected. Your message was not sent.',
+          timestamp: new Date(),
+        });
+        return;
       }
 
-      safeLocalStorage.removeItem(`draft_input_${selectedProject.projectId}`);
+      if (!isLoopInput) {
+        addMessage(userMessage);
+      }
+      // Mark this request as processing in the per-session activity map (the
+      // single source of truth the indicator derives from). The id is always
+      // concrete at this point — no pending placeholder exists anymore.
+      if (markedProcessing) {
+        onSessionProcessing?.(targetSessionId, {
+          statusText: null,
+          canInterrupt: true,
+        });
+      }
+
+      setIsUserScrolledUp(false);
+      setTimeout(() => scrollToBottom(), 100);
+
+      // A Loop input is not a ChatRun and has no `complete` event. Its recovery
+      // record now owns the text, so clear only the originating session draft;
+      // a rejection restores that exact draft without touching another chat.
+      if (isLoopInput) {
+        clearChatDraftIfUnchanged(targetDraftStorageKey, messageContent);
+        if (
+          draftStorageKeyRef.current === targetDraftStorageKey
+          && inputValueRef.current === messageContent
+        ) {
+          setInput('');
+          inputValueRef.current = '';
+          setAttachedImages([]);
+          setUploadingImages(new Map());
+          setImageErrors(new Map());
+          setIsTextareaExpanded(false);
+          if (textareaRef.current) textareaRef.current.style.height = 'auto';
+        }
+        resetCommandMenuState();
+        return;
+      }
+
+      const submittedDraftStillOwnsComposer = isSubmittedChatDraftCurrent({
+        currentKey: draftStorageKeyRef.current,
+        sourceKey: submittedDraftStorageKey,
+        targetKey: targetDraftStorageKey,
+        currentContent: inputValueRef.current,
+        submittedContent: messageContent,
+      });
+      if (submittedDraftStillOwnsComposer) {
+        setInput('');
+        inputValueRef.current = '';
+        resetCommandMenuState();
+        setAttachedImages([]);
+        setUploadingImages(new Map());
+        setImageErrors(new Map());
+        setIsTextareaExpanded(false);
+
+        if (textareaRef.current) {
+          textareaRef.current.style.height = 'auto';
+        }
+      }
+
+      clearChatDraftIfUnchanged(targetDraftStorageKey, messageContent);
+      if (
+        submittedDraftStorageKey
+        && submittedDraftStorageKey !== targetDraftStorageKey
+      ) {
+        clearChatDraftIfUnchanged(submittedDraftStorageKey, messageContent);
+      }
     },
     [
       selectedSession,
       attachedImages,
+      automation,
       buildSendOptions,
       currentSessionId,
       executeCommand,
@@ -858,6 +1140,7 @@ export function useChatComposerState({
       sendMessage,
       sessionKey,
       addMessage,
+      addMessageToSession,
       setIsUserScrolledUp,
       slashCommands,
     ],
@@ -942,28 +1225,30 @@ export function useChatComposerState({
     inputValueRef.current = input;
   }, [input]);
 
+  // Persist only when the in-memory draft still belongs to this render's
+  // session. During a session switch the owner ref deliberately lags one
+  // effect, preventing the old text from being written under the new key.
   useEffect(() => {
-    if (!selectedProjectId) {
-      return;
-    }
-    const savedInput = safeLocalStorage.getItem(`draft_input_${selectedProjectId}`) || '';
-    setInput((previous) => {
-      const next = previous === savedInput ? previous : savedInput;
-      inputValueRef.current = next;
-      return next;
-    });
-  }, [selectedProjectId]);
+    if (!draftStorageKey || draftStorageKeyRef.current !== draftStorageKey) return;
+    writeChatDraft(draftStorageKey, input);
+  }, [draftStorageKey, input]);
 
   useEffect(() => {
-    if (!selectedProjectId) {
+    draftStorageKeyRef.current = draftStorageKey;
+    if (!draftStorageKey || !selectedProjectId) {
+      setInput('');
+      inputValueRef.current = '';
       return;
     }
-    if (input !== '') {
-      safeLocalStorage.setItem(`draft_input_${selectedProjectId}`, input);
-    } else {
-      safeLocalStorage.removeItem(`draft_input_${selectedProjectId}`);
-    }
-  }, [input, selectedProjectId]);
+
+    const savedInput = readChatDraft(selectedProjectId, sessionKey);
+    setInput(savedInput);
+    inputValueRef.current = savedInput;
+    setAttachedImages([]);
+    setUploadingImages(new Map());
+    setImageErrors(new Map());
+    setIsTextareaExpanded(false);
+  }, [draftStorageKey, selectedProjectId, sessionKey]);
 
   // Persist the queued draft under its session's key. Must be defined BEFORE
   // the swap effect below: on a session switch there is one commit where
@@ -1118,8 +1403,9 @@ export function useChatComposerState({
     sendMessage({
       type: 'chat.abort',
       sessionId: targetSessionId,
+      automationId: automation?.automationId,
     });
-  }, [canAbortSession, currentSessionId, selectedSession?.id, sendMessage]);
+  }, [automation?.automationId, canAbortSession, currentSessionId, selectedSession?.id, sendMessage]);
 
   const handleGrantToolPermission = useCallback(
     (suggestion: { entry: string; toolName: string }) => {
@@ -1213,6 +1499,12 @@ export function useChatComposerState({
     handleAbortSession,
     handlePermissionDecision,
     handleGrantToolPermission,
+    handleAutomationInputAck,
+    handleChatRequestRejected,
+    handleChatRunComplete,
+    handleAutomationCommandObserved,
+    hasPendingAutomationInput,
+    retryPendingAutomationInputs,
     handleInputFocusChange,
     isInputFocused,
     commandModalPayload,

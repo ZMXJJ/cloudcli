@@ -15,8 +15,17 @@ import mime from 'mime-types';
 import Database from 'better-sqlite3';
 
 import { AppError, WORKSPACES_ROOT, getOpenCodeDatabasePath, validateWorkspacePath } from '@/shared/utils.js';
-import { closeSessionsWatcher, initializeSessionsWatcher } from '@/modules/providers/index.js';
-import { createWebSocketServer } from '@/modules/websocket/index.js';
+import { ClaudeAutomationService } from '@/modules/automations/index.js';
+import {
+    closeSessionsWatcher,
+    configureSessionRuntimeCleanup,
+    initializeSessionsWatcher,
+    sessionsService,
+} from '@/modules/providers/index.js';
+import {
+    broadcastAutomationState,
+    createWebSocketServer,
+} from '@/modules/websocket/index.js';
 
 import { getConnectableHost } from '../shared/networkHosts.js';
 
@@ -101,6 +110,12 @@ function readUsageNumber(value) {
 
 const app = express();
 const server = http.createServer(app);
+const claudeAutomationService = new ClaudeAutomationService({
+    onState: broadcastAutomationState,
+});
+configureSessionRuntimeCleanup((sessionId) => (
+    claudeAutomationService.stopForSessionDeletion(sessionId)
+));
 
 // Single WebSocket server that handles chat, shell, and plugin proxy paths.
 const wss = createWebSocketServer(server, {
@@ -123,6 +138,10 @@ const wss = createWebSocketServer(server, {
         },
         resolveToolApproval,
         getPendingApprovalsForSession,
+        automations: claudeAutomationService,
+        normalizeMessage: (provider, raw, sessionId) => (
+            sessionsService.normalizeMessage(provider, raw, sessionId)
+        ),
     },
     shell: {
         resolveProviderSessionId: (sessionId, provider) => {
@@ -1578,6 +1597,11 @@ async function startServer() {
         // Initialize authentication database
         await initializeDatabase();
 
+        // Detached Loop sessions survive a CloudCLI restart. Reconcile them
+        // before accepting chat traffic; headless Goals cannot be reattached
+        // and are marked failed with an explicit restart reason.
+        await claudeAutomationService.reconcileOnStartup();
+
         // Configure Web Push (VAPID keys)
         configureWebPush();
 
@@ -1620,25 +1644,39 @@ async function startServer() {
             });
         });
 
-        await closeSessionsWatcher();
         // Clean up plugin processes on shutdown
-        const shutdownRuntimeServices = async () => {
-            try {
-                await browserUseService.stopAllSessions();
-            } catch (err) {
-                console.error('[Browser] Error stopping sessions during shutdown:', err?.message || err);
-            }
-            try {
-                await stopAllPlugins();
-            } catch (err) {
-                console.error('[Plugins] Error stopping plugins during shutdown:', err?.message || err);
-            }
-            try {
-                await removeLocalServerMarker();
-            } catch (err) {
-                console.error('[Local Server] Error removing server marker during shutdown:', err?.message || err);
-            }
-            process.exit(0);
+        let shutdownPromise = null;
+        const shutdownRuntimeServices = () => {
+            if (shutdownPromise) return shutdownPromise;
+            shutdownPromise = (async () => {
+                try {
+                    await claudeAutomationService.shutdown();
+                } catch (err) {
+                    console.error('[Automation] Error stopping Goal sessions during shutdown:', err?.message || err);
+                }
+                try {
+                    await closeSessionsWatcher();
+                } catch (err) {
+                    console.error('[Sessions] Error stopping session watcher during shutdown:', err?.message || err);
+                }
+                try {
+                    await browserUseService.stopAllSessions();
+                } catch (err) {
+                    console.error('[Browser] Error stopping sessions during shutdown:', err?.message || err);
+                }
+                try {
+                    await stopAllPlugins();
+                } catch (err) {
+                    console.error('[Plugins] Error stopping plugins during shutdown:', err?.message || err);
+                }
+                try {
+                    await removeLocalServerMarker();
+                } catch (err) {
+                    console.error('[Local Server] Error removing server marker during shutdown:', err?.message || err);
+                }
+                process.exit(0);
+            })();
+            return shutdownPromise;
         };
         process.on('SIGTERM', () => void shutdownRuntimeServices());
         process.on('SIGINT', () => void shutdownRuntimeServices());

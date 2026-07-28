@@ -119,6 +119,42 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 `;
 
+export const CLAUDE_AUTOMATIONS_TABLE_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS claude_automations (
+    session_id TEXT PRIMARY KEY NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('goal', 'loop')),
+    state TEXT NOT NULL CHECK (state IN ('starting', 'running', 'stopping', 'completed', 'stopped', 'failed')),
+    runtime TEXT NOT NULL CHECK (runtime IN ('headless', 'tmux')),
+    command TEXT NOT NULL,
+    runtime_id TEXT,
+    native_task_id TEXT,
+    error TEXT,
+    started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at DATETIME,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+    ON DELETE CASCADE
+    ON UPDATE CASCADE
+);
+`;
+
+export const CLAUDE_AUTOMATION_INPUTS_TABLE_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS claude_automation_inputs (
+    session_id TEXT NOT NULL,
+    automation_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('processing', 'acknowledged', 'uncertain')),
+    error TEXT,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (automation_id, request_id),
+    FOREIGN KEY (session_id) REFERENCES claude_automations(session_id)
+    ON DELETE CASCADE
+    ON UPDATE CASCADE
+);
+`;
+
 export const LAST_SCANNED_AT_SQL = `
 CREATE TABLE IF NOT EXISTS scan_state (
   id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -173,6 +209,12 @@ ${SESSIONS_TABLE_SCHEMA_SQL}
 CREATE INDEX IF NOT EXISTS idx_session_ids_lookup ON sessions(session_id);
 -- NOTE: This index is created in migrations after sessions is rebuilt to include project_path.
 -- Creating it here can fail on upgraded installs where the legacy sessions table has no project_path.
+
+${CLAUDE_AUTOMATIONS_TABLE_SCHEMA_SQL}
+CREATE INDEX IF NOT EXISTS idx_claude_automations_state ON claude_automations(state);
+
+${CLAUDE_AUTOMATION_INPUTS_TABLE_SCHEMA_SQL}
+CREATE INDEX IF NOT EXISTS idx_claude_automation_inputs_session ON claude_automation_inputs(session_id);
 
 ${LAST_SCANNED_AT_SQL}
 

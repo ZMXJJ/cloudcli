@@ -193,9 +193,36 @@ export type MessageKind =
  */
 export type GatewayEventKind =
   | 'chat_subscribed'
+  | 'automation_state'
+  | 'automation_input_ack'
   | 'session_upserted'
   | 'loading_progress'
   | 'protocol_error';
+
+export type ClaudeAutomationKind = 'goal' | 'loop';
+
+export type ClaudeAutomationState =
+  | 'starting'
+  | 'running'
+  | 'stopping'
+  | 'completed'
+  | 'stopped'
+  | 'failed';
+
+export type ClaudeAutomationRuntime = 'headless' | 'tmux';
+
+/** Public, app-facing representation of a persistent Claude automation. */
+export type ClaudeAutomationSnapshot = {
+  automationId: string;
+  kind: ClaudeAutomationKind;
+  state: ClaudeAutomationState;
+  command: string;
+  runtime: ClaudeAutomationRuntime;
+  startedAt: string;
+  updatedAt: string;
+  completedAt?: string | null;
+  error?: string | null;
+};
 
 /**
  * Complete set of `kind` values emitted to websocket clients.
@@ -225,6 +252,8 @@ export type NormalizedMessage = {
    * the live events they missed across websocket reconnects.
    */
   seq?: number;
+  /** Stable generation id for the provider run that owns `seq`. */
+  runId?: string;
   role?: 'user' | 'assistant';
   content?: string;
   /**

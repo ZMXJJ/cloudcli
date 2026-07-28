@@ -12,21 +12,23 @@ import { normalizedToChatMessages } from './useChatMessages';
 
 const MESSAGES_PER_PAGE = 20;
 const INITIAL_VISIBLE_MESSAGES = 100;
+const EXTERNAL_REFRESH_DEBOUNCE_MS = 150;
 
 interface UseChatSessionStateArgs {
   selectedProject: Project | null;
   selectedSession: ProjectSession | null;
   ws: WebSocket | null;
-  sendMessage: (message: unknown) => void;
+  sendMessage: (message: unknown) => boolean;
   externalMessageUpdate?: number;
   newSessionTrigger?: number;
   processingSessions?: SessionActivityMap;
   onSessionIdle?: MarkSessionIdle;
-  resetStreamingState: () => void;
   /** When each session's `chat.subscribe` was last sent; guards stale idle acks. */
   statusCheckSentAtRef: MutableRefObject<Map<string, number>>;
   /** Highest live seq observed per session; sent as `lastSeq` on subscribe. */
   lastSeqRef: MutableRefObject<Map<string, number>>;
+  /** Provider run generation paired with each session's replay cursor. */
+  runIdRef: MutableRefObject<Map<string, string>>;
   sessionStore: SessionStore;
 }
 
@@ -102,9 +104,9 @@ export function useChatSessionState({
   newSessionTrigger,
   processingSessions,
   onSessionIdle,
-  resetStreamingState,
   statusCheckSentAtRef,
   lastSeqRef,
+  runIdRef,
   sessionStore,
 }: UseChatSessionStateArgs) {
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(selectedSession?.id || null);
@@ -135,6 +137,9 @@ export function useChatSessionState({
   const scrollPositionRef = useRef({ height: 0, top: 0 });
   const loadAllFinishedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const loadAllOverlayTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const externalRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const externalScrollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const externalRefreshQueueRef = useRef<Promise<void> | null>(null);
   const lastLoadedSessionKeyRef = useRef<string | null>(null);
   /**
    * Tracks the last processed value from `useProjectsState.newSessionTrigger`.
@@ -171,7 +176,6 @@ export function useChatSessionState({
      * - No dependence on route/tab/session-object identity changes.
      * - No coupling to unrelated external update signals.
      */
-    resetStreamingState();
     setCurrentSessionId(null);
     setPendingUserMessage(null);
     messagesOffsetRef.current = 0;
@@ -202,7 +206,7 @@ export function useChatSessionState({
       clearTimeout(loadAllFinishedTimerRef.current);
       loadAllFinishedTimerRef.current = null;
     }
-  }, [newSessionTrigger, onSessionIdle, resetStreamingState]);
+  }, [newSessionTrigger, onSessionIdle]);
 
   /* ---------------------------------------------------------------- */
   /*  Derive processing state for the viewed session                  */
@@ -283,18 +287,22 @@ export function useChatSessionState({
   /*  addMessage / clearMessages / rewindMessages                     */
   /* ---------------------------------------------------------------- */
 
+  const addMessageToSession = useCallback((sessionId: string, msg: ChatMessage) => {
+    const prov = (localStorage.getItem('selected-provider') as LLMProvider) || 'claude';
+    const normalized = chatMessageToNormalized(msg, sessionId, prov);
+    if (normalized) {
+      sessionStore.appendRealtime(sessionId, normalized);
+    }
+  }, [sessionStore]);
+
   const addMessage = useCallback((msg: ChatMessage) => {
     if (!activeSessionId) {
       // No session yet — show as pending until the backend creates one
       setPendingUserMessage(msg);
       return;
     }
-    const prov = (localStorage.getItem('selected-provider') as LLMProvider) || 'claude';
-    const normalized = chatMessageToNormalized(msg, activeSessionId, prov);
-    if (normalized) {
-      sessionStore.appendRealtime(activeSessionId, normalized);
-    }
-  }, [activeSessionId, sessionStore]);
+    addMessageToSession(activeSessionId, msg);
+  }, [activeSessionId, addMessageToSession]);
 
   const clearMessages = useCallback(() => {
     if (!activeSessionId) return;
@@ -485,7 +493,6 @@ export function useChatSessionState({
         return;
       }
 
-      resetStreamingState();
       setCurrentSessionId(null);
       messagesOffsetRef.current = 0;
       setHasMoreMessages(false);
@@ -508,6 +515,7 @@ export function useChatSessionState({
         type: 'chat.subscribe',
         sessions: [{
           sessionId: selectedSessionId,
+          runId: runIdRef.current.get(selectedSessionId),
           lastSeq: lastSeqRef.current.get(selectedSessionId) ?? 0,
         }],
       });
@@ -520,9 +528,6 @@ export function useChatSessionState({
     }
 
     const sessionChanged = currentSessionId !== null && currentSessionId !== selectedSessionId;
-    if (sessionChanged) {
-      resetStreamingState();
-    }
 
     // Reset pagination/scroll state
     messagesOffsetRef.current = 0;
@@ -570,36 +575,81 @@ export function useChatSessionState({
       setIsLoadingSessionMessages(false);
     });
   }, [
-    resetStreamingState,
     selectedProject,
     selectedSession?.id,
     sendMessage,
     statusCheckSentAtRef,
     lastSeqRef,
+    runIdRef,
     ws,
     sessionStore,
   ]);
 
   // External message update (e.g. WebSocket reconnect, background refresh)
   useEffect(() => {
-    if (!externalMessageUpdate || !selectedSession || !selectedProject) return;
+    let cancelled = false;
+    if (externalRefreshTimerRef.current) {
+      clearTimeout(externalRefreshTimerRef.current);
+      externalRefreshTimerRef.current = null;
+    }
+    if (externalScrollTimerRef.current) {
+      clearTimeout(externalScrollTimerRef.current);
+      externalScrollTimerRef.current = null;
+    }
+    if (!externalMessageUpdate || !selectedSession || !selectedProject || isProcessing) {
+      return () => {
+        cancelled = true;
+      };
+    }
 
-    const reloadExternalMessages = async () => {
-      try {
-        // Skip store refresh during active streaming
-        if (!isProcessing) {
-          await sessionStore.refreshFromServer(selectedSession.id);
+    const sessionId = selectedSession.id;
+    const timer = setTimeout(() => {
+      externalRefreshTimerRef.current = null;
+      const operation = (externalRefreshQueueRef.current ?? Promise.resolve()).then(async () => {
+        if (cancelled) return;
+        const shouldScroll = isNearBottom();
+        const slot = await sessionStore.refreshTailFromServer(sessionId);
+        if (cancelled) return;
 
-          if (isNearBottom()) {
-            setTimeout(() => scrollToBottom(), 200);
-          }
+        setHasMoreMessages(slot.hasMore);
+        setTotalMessages(slot.total);
+        messagesOffsetRef.current = slot.offset;
+        if (slot.tokenUsage) setTokenBudget(slot.tokenUsage as Record<string, unknown>);
+        if (slot.hasMore && allMessagesLoadedRef.current) {
+          allMessagesLoadedRef.current = false;
+          setAllMessagesLoaded(false);
         }
-      } catch (error) {
+
+        if (shouldScroll) {
+          externalScrollTimerRef.current = setTimeout(() => {
+            scrollToBottom();
+            externalScrollTimerRef.current = null;
+          }, 200);
+        }
+      });
+      const trackedOperation = operation.catch((error) => {
         console.error('Error reloading messages from external update:', error);
+      });
+      externalRefreshQueueRef.current = trackedOperation;
+      void trackedOperation.finally(() => {
+        if (externalRefreshQueueRef.current === trackedOperation) {
+          externalRefreshQueueRef.current = null;
+        }
+      });
+    }, EXTERNAL_REFRESH_DEBOUNCE_MS);
+    externalRefreshTimerRef.current = timer;
+
+    return () => {
+      cancelled = true;
+      if (externalRefreshTimerRef.current === timer) {
+        clearTimeout(timer);
+        externalRefreshTimerRef.current = null;
+      }
+      if (externalScrollTimerRef.current) {
+        clearTimeout(externalScrollTimerRef.current);
+        externalScrollTimerRef.current = null;
       }
     };
-
-    reloadExternalMessages();
   }, [
     externalMessageUpdate,
     isNearBottom,
@@ -829,6 +879,7 @@ export function useChatSessionState({
   return {
     chatMessages,
     addMessage,
+    addMessageToSession,
     clearMessages,
     rewindMessages,
     sessionActivity,

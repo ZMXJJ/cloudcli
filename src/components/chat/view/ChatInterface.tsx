@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ArrowDownIcon } from 'lucide-react';
 
@@ -6,12 +6,14 @@ import { useTasksSettings } from '../../../contexts/TasksSettingsContext';
 import { useWebSocket } from '../../../contexts/WebSocketContext';
 import PermissionContext from '../../../contexts/PermissionContext';
 import { QuickSettingsPanel } from '../../quick-settings-panel';
-import type { ChatInterfaceProps, Provider  } from '../types/types';
+import type { ChatAutomation, ChatInterfaceProps, Provider  } from '../types/types';
 import { useChatProviderState } from '../hooks/useChatProviderState';
 import { useChatSessionState } from '../hooks/useChatSessionState';
-import { useChatRealtimeHandlers } from '../hooks/useChatRealtimeHandlers';
+import { useChatRealtimeHandlers, type ChatStreamState } from '../hooks/useChatRealtimeHandlers';
 import { useChatComposerState } from '../hooks/useChatComposerState';
 import { useSessionStore } from '../../../stores/useSessionStore';
+import { guardProcessingForAutomationGeneration } from '../utils/pendingChatRequests';
+import { sendAutomationControl } from '../utils/automationControls';
 
 import ChatMessagesPane from './subcomponents/ChatMessagesPane';
 import ChatComposer from './subcomponents/ChatComposer';
@@ -42,8 +44,7 @@ function ChatInterface({
   const { t } = useTranslation('chat');
 
   const sessionStore = useSessionStore();
-  const streamTimerRef = useRef<number | null>(null);
-  const accumulatedStreamRef = useRef('');
+  const streamStateRef = useRef(new Map<string, ChatStreamState>());
   // When each session's `chat.subscribe` was last sent; idle acks older than
   // a later local request are discarded as stale.
   const statusCheckSentAtRef = useRef(new Map<string, number>());
@@ -51,13 +52,30 @@ function ChatInterface({
   // on every sequenced frame, read whenever a `chat.subscribe` is sent so the
   // server replays only the events this client actually missed.
   const lastSeqRef = useRef(new Map<string, number>());
+  const runIdRef = useRef(new Map<string, string>());
+  const [automationsBySession, setAutomationsBySession] = useState<Map<string, ChatAutomation>>(
+    () => new Map(),
+  );
+  const automationsBySessionRef = useRef(automationsBySession);
+  const [automationControlErrors, setAutomationControlErrors] = useState<Map<string, string>>(
+    () => new Map(),
+  );
 
-  const resetStreamingState = useCallback(() => {
-    if (streamTimerRef.current) {
-      clearTimeout(streamTimerRef.current);
-      streamTimerRef.current = null;
+  const handleAutomationState = useCallback((sessionId: string, automation: ChatAutomation | null) => {
+    const next = new Map(automationsBySessionRef.current);
+    if (automation) {
+      next.set(sessionId, automation);
+    } else {
+      next.delete(sessionId);
     }
-    accumulatedStreamRef.current = '';
+    automationsBySessionRef.current = next;
+    setAutomationsBySession(next);
+    setAutomationControlErrors((previous) => {
+      if (!previous.has(sessionId)) return previous;
+      const nextErrors = new Map(previous);
+      nextErrors.delete(sessionId);
+      return nextErrors;
+    });
   }, []);
 
   const {
@@ -93,6 +111,7 @@ function ChatInterface({
   const {
     chatMessages,
     addMessage,
+    addMessageToSession,
     sessionActivity,
     isProcessing,
     canAbortSession,
@@ -128,9 +147,9 @@ function ChatInterface({
     newSessionTrigger,
     processingSessions,
     onSessionIdle,
-    resetStreamingState,
     statusCheckSentAtRef,
     lastSeqRef,
+    runIdRef,
     sessionStore,
   });
 
@@ -142,6 +161,12 @@ function ChatInterface({
     onSessionEstablished?.(sessionId, context);
     onNavigateToSession?.(sessionId);
   }, [setCurrentSessionId, onSessionEstablished, onNavigateToSession]);
+
+  const viewedSessionId = selectedSession?.id || currentSessionId || null;
+  const automation = viewedSessionId ? automationsBySession.get(viewedSessionId) || null : null;
+  const automationControlError = viewedSessionId
+    ? automationControlErrors.get(viewedSessionId) || null
+    : null;
 
   const {
     input,
@@ -186,6 +211,12 @@ function ChatInterface({
     handleAbortSession,
     handlePermissionDecision,
     handleGrantToolPermission,
+    handleAutomationInputAck: consumeAutomationInputAckResponse,
+    handleChatRequestRejected: consumeChatRequestRejectionResponse,
+    handleChatRunComplete,
+    handleAutomationCommandObserved,
+    hasPendingAutomationInput,
+    retryPendingAutomationInputs,
     handleInputFocusChange,
     isInputFocused,
     commandModalPayload,
@@ -203,6 +234,7 @@ function ChatInterface({
     codexModel,
     currentProviderEffort,
     opencodeModel,
+    automation,
     isLoading: isProcessing,
     canAbortSession,
     tokenBudget,
@@ -215,10 +247,29 @@ function ChatInterface({
     onShowSettings,
     scrollToBottom,
     addMessage,
+    addMessageToSession,
     setIsUserScrolledUp,
     setPendingPermissionRequests,
     resolvePermissionModeForProvider,
   });
+
+  const handleAutomationInputAck = useCallback((
+    sessionId: string,
+    requestId: string,
+    automationId: string,
+  ) => guardProcessingForAutomationGeneration(
+    consumeAutomationInputAckResponse(sessionId, requestId, automationId),
+    automationsBySessionRef.current.get(sessionId)?.automationId,
+  ), [consumeAutomationInputAckResponse]);
+
+  const handleChatRequestRejected = useCallback((
+    sessionId: string,
+    requestId: string,
+    automationId?: string | null,
+  ) => guardProcessingForAutomationGeneration(
+    consumeChatRequestRejectionResponse(sessionId, requestId, automationId),
+    automationsBySessionRef.current.get(sessionId)?.automationId,
+  ), [consumeChatRequestRejectionResponse]);
 
   // On WebSocket reconnect, re-fetch the current session's messages from the
   // server so missed streaming events are shown, then re-subscribe — the
@@ -226,16 +277,31 @@ function ChatInterface({
   // missed live events, and re-attaches a still-running stream to this socket.
   const handleWebSocketReconnect = useCallback(async () => {
     if (!selectedProject || !selectedSession) return;
-    await sessionStore.refreshFromServer(selectedSession.id);
+    try {
+      await sessionStore.refreshFromServer(selectedSession.id);
+    } catch (error) {
+      console.error('[Chat] Failed to refresh history after reconnect:', error);
+    }
     statusCheckSentAtRef.current.set(selectedSession.id, Date.now());
     sendMessage({
       type: 'chat.subscribe',
       sessions: [{
         sessionId: selectedSession.id,
+        runId: runIdRef.current.get(selectedSession.id),
         lastSeq: lastSeqRef.current.get(selectedSession.id) ?? 0,
       }],
     });
   }, [selectedProject, selectedSession, sendMessage, sessionStore]);
+
+  // Re-send unresolved Loop inputs with their original request ids. The server
+  // either replays a persisted ACK or joins the existing input operation, so a
+  // reconnect or page reload cannot inject the same turn twice.
+  useEffect(() => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    for (const sessionId of retryPendingAutomationInputs()) {
+      onSessionProcessing?.(sessionId, { statusText: null, canInterrupt: true });
+    }
+  }, [onSessionProcessing, retryPendingAutomationInputs, ws]);
 
   useChatRealtimeHandlers({
     subscribe,
@@ -245,15 +311,62 @@ function ChatInterface({
     setTokenBudget,
     pendingPermissionRequests,
     setPendingPermissionRequests,
-    streamTimerRef,
-    accumulatedStreamRef,
+    streamStateRef,
     lastSeqRef,
+    runIdRef,
     statusCheckSentAtRef,
     onSessionProcessing,
     onSessionIdle,
+    onAutomationState: handleAutomationState,
+    onAutomationInputAck: handleAutomationInputAck,
+    onChatRequestRejected: handleChatRequestRejected,
+    onChatRunComplete: handleChatRunComplete,
+    onAutomationCommandObserved: handleAutomationCommandObserved,
+    hasPendingAutomationInput,
     onWebSocketReconnect: handleWebSocketReconnect,
     sessionStore,
   });
+
+  const handleStopAutomation = useCallback(() => {
+    if (!viewedSessionId || !automation) return;
+    const sent = sendAutomationControl(
+      sendMessage,
+      'stop',
+      viewedSessionId,
+      automation.automationId,
+    );
+    setAutomationControlErrors((previous) => {
+      const next = new Map(previous);
+      if (sent) {
+        next.delete(viewedSessionId);
+      } else {
+        next.set(viewedSessionId, t('automation.errors.stopNotSent', {
+          defaultValue: 'Stop was not sent because the chat connection is offline. Reconnect and retry.',
+        }));
+      }
+      return next;
+    });
+  }, [automation, sendMessage, t, viewedSessionId]);
+  const handleDismissAutomation = useCallback(() => {
+    if (!viewedSessionId || !automation) return;
+    const sent = sendAutomationControl(
+      sendMessage,
+      'dismiss',
+      viewedSessionId,
+      automation.automationId,
+    );
+    setAutomationControlErrors((previous) => {
+      const next = new Map(previous);
+      if (sent) {
+        next.delete(viewedSessionId);
+      } else {
+        next.set(viewedSessionId, t('automation.errors.dismissNotSent', {
+          defaultValue: 'Dismiss was not sent because the chat connection is offline. Reconnect and retry.',
+        }));
+      }
+      return next;
+    });
+  }, [automation, sendMessage, t, viewedSessionId]);
 
   useEffect(() => {
     if (!canAbortSession) {
@@ -276,10 +389,14 @@ function ChatInterface({
   }, [canAbortSession, handleAbortSession]);
 
   useEffect(() => {
+    const streams = streamStateRef.current;
     return () => {
-      resetStreamingState();
+      for (const stream of streams.values()) {
+        if (stream.timer !== null) clearTimeout(stream.timer);
+      }
+      streams.clear();
     };
-  }, [resetStreamingState]);
+  }, []);
 
   const permissionContextValue = useMemo(() => ({
     pendingPermissionRequests,
@@ -382,75 +499,79 @@ function ChatInterface({
           )}
 
           <ChatComposer
-          pendingPermissionRequests={pendingPermissionRequests}
-          handlePermissionDecision={handlePermissionDecision}
-          handleGrantToolPermission={handleGrantToolPermission}
-          activity={sessionActivity}
-          isLoading={isProcessing}
-          onAbortSession={handleAbortSession}
-          permissionMode={permissionMode}
-          onModeSwitch={cyclePermissionMode}
-          effort={currentProviderEffort}
-          availableEffortOptions={currentProviderEffortOptions}
-          onSelectEffort={(nextEffort) => setStoredProviderEffort(provider, nextEffort)}
-          tokenBudget={tokenBudget}
-          onShowTokenUsage={showCostModal}
-          slashCommandsCount={slashCommandsCount}
-          onToggleCommandMenu={handleToggleCommandMenu}
-          hasInput={Boolean(input.trim())}
-          onClearInput={handleClearInput}
-          onSubmit={handleSubmit}
-          isDragActive={isDragActive}
-          queuedDraft={queuedDraft}
-          onEditQueuedDraft={editQueuedDraft}
-          onDeleteQueuedDraft={deleteQueuedDraft}
-          attachedImages={attachedImages}
-          onRemoveImage={(index) =>
-            setAttachedImages((previous) =>
-              previous.filter((_, currentIndex) => currentIndex !== index),
-            )
-          }
-          uploadingImages={uploadingImages}
-          imageErrors={imageErrors}
-          showFileDropdown={showFileDropdown}
-          filteredFiles={filteredFiles}
-          selectedFileIndex={selectedFileIndex}
-          onSelectFile={selectFile}
-          filteredCommands={filteredCommands}
-          selectedCommandIndex={selectedCommandIndex}
-          onCommandSelect={handleCommandSelect}
-          onCloseCommandMenu={resetCommandMenuState}
-          isCommandMenuOpen={showCommandMenu}
-          frequentCommands={commandQuery ? [] : frequentCommands}
-          getRootProps={getRootProps as (...args: unknown[]) => Record<string, unknown>}
-          getInputProps={getInputProps as (...args: unknown[]) => Record<string, unknown>}
-          openImagePicker={openImagePicker}
-          inputHighlightRef={inputHighlightRef}
-          renderInputWithMentions={renderInputWithMentions}
-          textareaRef={textareaRef}
-          input={input}
-          onVoiceTranscript={handleVoiceTranscript}
-          onInputChange={handleInputChange}
-          onTextareaClick={handleTextareaClick}
-          onTextareaKeyDown={handleKeyDown}
-          onTextareaPaste={handlePaste}
-          onTextareaScrollSync={syncInputOverlayScroll}
-          onTextareaInput={handleTextareaInput}
-          isInputFocused={isInputFocused}
-          onInputFocusChange={handleInputFocusChange}
-          placeholder={t('input.placeholder', {
-            provider:
-              provider === 'cursor'
-                ? t('messageTypes.cursor')
-                : provider === 'codex'
-                  ? t('messageTypes.codex')
-                  : provider === 'opencode'
-                      ? t('messageTypes.opencode', { defaultValue: 'OpenCode' })
-                    : t('messageTypes.claude'),
-          })}
-          isTextareaExpanded={isTextareaExpanded}
-          sendByCtrlEnter={sendByCtrlEnter}
-        />
+            automation={automation}
+            automationControlError={automationControlError}
+            onStopAutomation={handleStopAutomation}
+            onDismissAutomation={handleDismissAutomation}
+            pendingPermissionRequests={pendingPermissionRequests}
+            handlePermissionDecision={handlePermissionDecision}
+            handleGrantToolPermission={handleGrantToolPermission}
+            activity={sessionActivity}
+            isLoading={isProcessing}
+            onAbortSession={handleAbortSession}
+            permissionMode={permissionMode}
+            onModeSwitch={cyclePermissionMode}
+            effort={currentProviderEffort}
+            availableEffortOptions={currentProviderEffortOptions}
+            onSelectEffort={(nextEffort) => setStoredProviderEffort(provider, nextEffort)}
+            tokenBudget={tokenBudget}
+            onShowTokenUsage={showCostModal}
+            slashCommandsCount={slashCommandsCount}
+            onToggleCommandMenu={handleToggleCommandMenu}
+            hasInput={Boolean(input.trim())}
+            onClearInput={handleClearInput}
+            onSubmit={handleSubmit}
+            isDragActive={isDragActive}
+            queuedDraft={queuedDraft}
+            onEditQueuedDraft={editQueuedDraft}
+            onDeleteQueuedDraft={deleteQueuedDraft}
+            attachedImages={attachedImages}
+            onRemoveImage={(index) =>
+              setAttachedImages((previous) =>
+                previous.filter((_, currentIndex) => currentIndex !== index),
+              )
+            }
+            uploadingImages={uploadingImages}
+            imageErrors={imageErrors}
+            showFileDropdown={showFileDropdown}
+            filteredFiles={filteredFiles}
+            selectedFileIndex={selectedFileIndex}
+            onSelectFile={selectFile}
+            filteredCommands={filteredCommands}
+            selectedCommandIndex={selectedCommandIndex}
+            onCommandSelect={handleCommandSelect}
+            onCloseCommandMenu={resetCommandMenuState}
+            isCommandMenuOpen={showCommandMenu}
+            frequentCommands={commandQuery ? [] : frequentCommands}
+            getRootProps={getRootProps as (...args: unknown[]) => Record<string, unknown>}
+            getInputProps={getInputProps as (...args: unknown[]) => Record<string, unknown>}
+            openImagePicker={openImagePicker}
+            inputHighlightRef={inputHighlightRef}
+            renderInputWithMentions={renderInputWithMentions}
+            textareaRef={textareaRef}
+            input={input}
+            onVoiceTranscript={handleVoiceTranscript}
+            onInputChange={handleInputChange}
+            onTextareaClick={handleTextareaClick}
+            onTextareaKeyDown={handleKeyDown}
+            onTextareaPaste={handlePaste}
+            onTextareaScrollSync={syncInputOverlayScroll}
+            onTextareaInput={handleTextareaInput}
+            isInputFocused={isInputFocused}
+            onInputFocusChange={handleInputFocusChange}
+            placeholder={t('input.placeholder', {
+              provider:
+                provider === 'cursor'
+                  ? t('messageTypes.cursor')
+                  : provider === 'codex'
+                    ? t('messageTypes.codex')
+                    : provider === 'opencode'
+                        ? t('messageTypes.opencode', { defaultValue: 'OpenCode' })
+                      : t('messageTypes.claude'),
+            })}
+            isTextareaExpanded={isTextareaExpanded}
+            sendByCtrlEnter={sendByCtrlEnter}
+          />
         </div>
       </div>
 

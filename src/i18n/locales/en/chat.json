@@ -111,6 +111,32 @@
     "stopSpeaking": "Stop",
     "loading": "Loading…"
   },
+  "automation": {
+    "kind": {
+      "goal": "Goal",
+      "loop": "Loop"
+    },
+    "state": {
+      "starting": "Starting",
+      "running": "Running",
+      "stopping": "Stopping",
+      "completed": "Completed",
+      "stopped": "Stopped",
+      "failed": "Failed"
+    },
+    "actions": {
+      "stop": "Stop",
+      "stopLabel": "Stop {{kind}}",
+      "retryStop": "Retry stop",
+      "retryStopLabel": "Retry stopping {{kind}}",
+      "dismiss": "Dismiss status"
+    },
+    "errors": {
+      "stopNotSent": "Stop was not sent because the chat connection is offline. Reconnect and retry.",
+      "dismissNotSent": "Dismiss was not sent because the chat connection is offline. Reconnect and retry."
+    },
+    "runtime": "Runtime: {{runtime}}"
+  },
   "input": {
     "placeholder": "Type / for commands, @ for files, or ask {{provider}} anything...",
     "placeholderDefault": "Type your message...",

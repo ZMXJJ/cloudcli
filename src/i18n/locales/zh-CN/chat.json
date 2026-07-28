@@ -102,6 +102,32 @@
     },
     "technicalDetails": "技术细节"
   },
+  "automation": {
+    "kind": {
+      "goal": "目标",
+      "loop": "循环"
+    },
+    "state": {
+      "starting": "正在启动",
+      "running": "运行中",
+      "stopping": "正在停止",
+      "completed": "已完成",
+      "stopped": "已停止",
+      "failed": "失败"
+    },
+    "actions": {
+      "stop": "停止",
+      "stopLabel": "停止{{kind}}",
+      "retryStop": "重试停止",
+      "retryStopLabel": "重试停止{{kind}}",
+      "dismiss": "关闭状态"
+    },
+    "errors": {
+      "stopNotSent": "聊天连接已断开，停止请求未发送。请重新连接后重试。",
+      "dismissNotSent": "聊天连接已断开，关闭状态请求未发送。请重新连接后重试。"
+    },
+    "runtime": "运行环境：{{runtime}}"
+  },
   "input": {
     "placeholder": "输入 / 调用命令，@ 选择文件，或向 {{provider}} 提问...",
     "placeholderDefault": "输入您的消息...",

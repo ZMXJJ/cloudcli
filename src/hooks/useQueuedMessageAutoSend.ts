@@ -13,7 +13,7 @@ interface UseQueuedMessageAutoSendArgs {
    */
   activeSessionId: string | null;
   ws: WebSocket | null;
-  sendMessage: (message: unknown) => void;
+  sendMessage: (message: unknown) => boolean;
   markSessionProcessing: MarkSessionProcessing;
 }
 
@@ -57,14 +57,16 @@ export function useQueuedMessageAutoSend({
         continue;
       }
 
-      clearQueuedMessage(sessionId);
-      sendMessage({
+      const sent = sendMessage({
         type: 'chat.send',
         sessionId,
         content: queued.content,
         options: { ...(queued.options ?? {}), images: [] },
       });
-      markSessionProcessing(sessionId, { statusText: null, canInterrupt: true });
+      if (sent) {
+        clearQueuedMessage(sessionId);
+        markSessionProcessing(sessionId, { statusText: null, canInterrupt: true });
+      }
     }
   }, [processingSessions, activeSessionId, ws, sendMessage, markSessionProcessing]);
 }

@@ -5,9 +5,10 @@ import type { ServerEvent } from '../../../contexts/WebSocketContext';
 import { showCompletionTitleIndicator } from '../../../utils/pageTitleNotification';
 import { playChatCompletionSound, playNotificationSound } from '../../../utils/notificationSound';
 import type { MarkSessionIdle, MarkSessionProcessing } from '../../../hooks/useSessionProtection';
-import type { PendingPermissionRequest } from '../types/types';
+import type { ChatAutomation, PendingPermissionRequest } from '../types/types';
 import type { ProjectSession, LLMProvider } from '../../../types/app';
 import type { SessionStore, NormalizedMessage } from '../../../stores/useSessionStore';
+import type { PendingChatRequestResult } from '../utils/pendingChatRequests';
 
 const isActionablePermissionRequest = (request: { toolName?: unknown } | null | undefined): boolean => {
   return request?.toolName !== 'ExitPlanMode' && request?.toolName !== 'exit_plan_mode';
@@ -25,8 +26,7 @@ interface UseChatRealtimeHandlersArgs {
   setTokenBudget: (budget: Record<string, unknown> | null) => void;
   pendingPermissionRequests: PendingPermissionRequest[];
   setPendingPermissionRequests: Dispatch<SetStateAction<PendingPermissionRequest[]>>;
-  streamTimerRef: MutableRefObject<number | null>;
-  accumulatedStreamRef: MutableRefObject<string>;
+  streamStateRef: MutableRefObject<Map<string, ChatStreamState>>;
   /**
    * Highest live `seq` observed per session. Essential for reconnect catch-up:
    * `chat.subscribe` sends this value as `lastSeq` so the server replays only
@@ -34,13 +34,67 @@ interface UseChatRealtimeHandlersArgs {
    * frame; read wherever a `chat.subscribe` is sent (session open, reconnect).
    */
   lastSeqRef: MutableRefObject<Map<string, number>>;
+  /** Run generation paired with each session's replay sequence. */
+  runIdRef: MutableRefObject<Map<string, string>>;
   /** When each session's `chat.subscribe` was last sent; guards stale idle acks. */
   statusCheckSentAtRef: MutableRefObject<Map<string, number>>;
   onSessionProcessing?: MarkSessionProcessing;
   onSessionIdle?: MarkSessionIdle;
+  onAutomationState?: (sessionId: string, automation: ChatAutomation | null) => void;
+  onAutomationInputAck?: (
+    sessionId: string,
+    requestId: string,
+    automationId: string,
+  ) => PendingChatRequestResult;
+  onChatRequestRejected?: (
+    sessionId: string,
+    requestId: string,
+    automationId?: string | null,
+  ) => PendingChatRequestResult;
+  onChatRunComplete?: (sessionId: string) => void;
+  onAutomationCommandObserved?: (sessionId: string, requestId: string) => void;
+  hasPendingAutomationInput?: (sessionId: string) => boolean;
   onWebSocketReconnect?: () => void;
   sessionStore: SessionStore;
 }
+
+export type ChatStreamState = {
+  runId: string | null;
+  provider: LLMProvider;
+  text: string;
+  timer: number | null;
+};
+
+const AUTOMATION_KINDS = new Set(['goal', 'loop']);
+const AUTOMATION_STATES = new Set([
+  'starting',
+  'running',
+  'stopping',
+  'completed',
+  'stopped',
+  'failed',
+]);
+const isChatAutomation = (value: unknown): value is ChatAutomation => {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+
+  const automation = value as Record<string, unknown>;
+  return (
+    typeof automation.automationId === 'string'
+    && automation.automationId.length > 0
+    && typeof automation.kind === 'string'
+    && AUTOMATION_KINDS.has(automation.kind)
+    && typeof automation.state === 'string'
+    && AUTOMATION_STATES.has(automation.state)
+    && typeof automation.command === 'string'
+    && typeof automation.runtime === 'string'
+    && typeof automation.startedAt === 'string'
+    && typeof automation.updatedAt === 'string'
+    && (automation.completedAt == null || typeof automation.completedAt === 'string')
+    && (automation.error == null || typeof automation.error === 'string')
+  );
+};
 
 /* ------------------------------------------------------------------ */
 /*  Hook                                                              */
@@ -63,12 +117,18 @@ export function useChatRealtimeHandlers({
   setTokenBudget,
   pendingPermissionRequests,
   setPendingPermissionRequests,
-  streamTimerRef,
-  accumulatedStreamRef,
+  streamStateRef,
   lastSeqRef,
+  runIdRef,
   statusCheckSentAtRef,
   onSessionProcessing,
   onSessionIdle,
+  onAutomationState,
+  onAutomationInputAck,
+  onChatRequestRejected,
+  onChatRunComplete,
+  onAutomationCommandObserved,
+  hasPendingAutomationInput,
   onWebSocketReconnect,
   sessionStore,
 }: UseChatRealtimeHandlersArgs) {
@@ -97,7 +157,21 @@ export function useChatRealtimeHandlers({
       const activeViewSessionId = activeViewSessionIdRef.current;
       const sid = (typeof msg.sessionId === 'string' && msg.sessionId) || activeViewSessionId;
 
-      // Record replay progress for every sequenced live event.
+      const messageRunId = typeof msg.runId === 'string' && msg.runId ? msg.runId : null;
+      if (sid && messageRunId) {
+        const knownRunId = runIdRef.current.get(sid);
+        if (knownRunId !== messageRunId) {
+          const staleStream = streamStateRef.current.get(sid);
+          if (staleStream?.timer !== null && staleStream?.timer !== undefined) {
+            window.clearTimeout(staleStream.timer);
+          }
+          streamStateRef.current.delete(sid);
+          runIdRef.current.set(sid, messageRunId);
+          lastSeqRef.current.set(sid, 0);
+        }
+      }
+
+      // Record replay progress for every sequenced live event in this run.
       if (sid && typeof msg.seq === 'number') {
         const known = lastSeqRef.current.get(sid) ?? 0;
         if (msg.seq > known) {
@@ -115,9 +189,14 @@ export function useChatRealtimeHandlers({
           // pending tool-permission prompts for the run.
           if (!sid) return;
 
+          if (msg.runId === null) {
+            runIdRef.current.delete(sid);
+            lastSeqRef.current.delete(sid);
+          }
+
           if (msg.isProcessing) {
             onSessionProcessing?.(sid);
-          } else {
+          } else if (!hasPendingAutomationInput?.(sid)) {
             // Idle ack: ignore it if a newer request started after the
             // subscribe was sent — the ack describes the older state.
             onSessionIdle?.(sid, {
@@ -138,15 +217,73 @@ export function useChatRealtimeHandlers({
               void playNotificationSound();
             }
           }
+
+          if (Object.prototype.hasOwnProperty.call(msg, 'automation')) {
+            if (msg.automation === null) {
+              onAutomationState?.(sid, null);
+            } else if (isChatAutomation(msg.automation)) {
+              onAutomationState?.(sid, msg.automation);
+            } else {
+              console.warn('[Chat] Ignoring invalid automation in chat_subscribed:', msg.automation);
+            }
+          }
+          return;
+        }
+
+        case 'automation_state': {
+          if (!sid) return;
+
+          if (msg.automation === null) {
+            onAutomationState?.(sid, null);
+          } else if (isChatAutomation(msg.automation)) {
+            onAutomationState?.(sid, msg.automation);
+          } else {
+            console.warn('[Chat] Ignoring invalid automation_state payload:', msg.automation);
+            return;
+          }
+          if (typeof msg.requestId === 'string') {
+            onAutomationCommandObserved?.(sid, msg.requestId);
+          }
+          return;
+        }
+
+        case 'automation_input_ack': {
+          if (
+            !sid
+            || typeof msg.requestId !== 'string'
+            || typeof msg.automationId !== 'string'
+          ) {
+            return;
+          }
+
+          const acknowledgement = onAutomationInputAck?.(sid, msg.requestId, msg.automationId);
+          if (acknowledgement?.matched && acknowledgement.clearProcessing) {
+            onSessionIdle?.(sid);
+          }
           return;
         }
 
         case 'protocol_error': {
           console.error('[Chat] Protocol error:', msg.code, msg.error);
           if (sid) {
-            // Surface the failure in the conversation and stop the spinner —
-            // the run never started (or was rejected), so no `complete` follows.
-            onSessionIdle?.(sid);
+            const rejection = typeof msg.requestId === 'string'
+              ? onChatRequestRejected?.(
+                  sid,
+                  msg.requestId,
+                  typeof msg.automationId === 'string' ? msg.automationId : null,
+                )
+              : undefined;
+
+            // Only the request that established the local busy state may
+            // clear it. Errors from stale tabs, Stop/Dismiss, or a rejected
+            // concurrent send must not tear down an unrelated active run.
+            if (
+              rejection?.matched
+              && rejection.clearProcessing
+              && msg.preserveProcessing !== true
+            ) {
+              onSessionIdle?.(sid);
+            }
             sessionStore.appendRealtime(sid, {
               id: `protocol_error_${Date.now()}`,
               sessionId: sid,
@@ -159,7 +296,7 @@ export function useChatRealtimeHandlers({
           return;
         }
 
-        // Sidebar/global events — owned by useProjectsState.
+        // Sidebar/global events are owned by useProjectsState.
         case 'session_upserted':
         case 'loading_progress':
           return;
@@ -176,34 +313,44 @@ export function useChatRealtimeHandlers({
       if (msg.kind === 'stream_delta') {
         const text = (msg.content as string) || '';
         if (!text) return;
-        accumulatedStreamRef.current += text;
-        if (!streamTimerRef.current) {
-          streamTimerRef.current = window.setTimeout(() => {
-            streamTimerRef.current = null;
-            if (sid) {
-              sessionStore.updateStreaming(sid, accumulatedStreamRef.current, provider);
+        if (!sid) return;
+        const eventProvider = typeof msg.provider === 'string'
+          ? msg.provider as LLMProvider
+          : provider;
+        let stream = streamStateRef.current.get(sid);
+        if (!stream || stream.runId !== messageRunId) {
+          if (stream?.timer !== null && stream?.timer !== undefined) {
+            window.clearTimeout(stream.timer);
+          }
+          stream = { runId: messageRunId, provider: eventProvider, text: '', timer: null };
+          streamStateRef.current.set(sid, stream);
+        }
+        stream.text += text;
+        if (stream.timer === null) {
+          const scheduledStream = stream;
+          stream.timer = window.setTimeout(() => {
+            scheduledStream.timer = null;
+            if (streamStateRef.current.get(sid) === scheduledStream) {
+              sessionStore.updateStreaming(sid, scheduledStream.text, scheduledStream.provider);
             }
           }, 100);
-        }
-        // Also route to store for non-active sessions
-        if (sid && sid !== activeViewSessionId) {
-          sessionStore.appendRealtime(sid, msg as unknown as NormalizedMessage);
         }
         return;
       }
 
       if (msg.kind === 'stream_end') {
-        if (streamTimerRef.current) {
-          clearTimeout(streamTimerRef.current);
-          streamTimerRef.current = null;
+        if (!sid) return;
+        const stream = streamStateRef.current.get(sid);
+        if (stream?.timer !== null && stream?.timer !== undefined) {
+          clearTimeout(stream.timer);
         }
-        if (sid) {
-          if (accumulatedStreamRef.current) {
-            sessionStore.updateStreaming(sid, accumulatedStreamRef.current, provider);
-          }
+        if (stream?.text) {
+          sessionStore.updateStreaming(sid, stream.text, stream.provider);
+        }
+        if (stream) {
           sessionStore.finalizeStreaming(sid);
         }
-        accumulatedStreamRef.current = '';
+        streamStateRef.current.delete(sid);
         return;
       }
 
@@ -222,20 +369,23 @@ export function useChatRealtimeHandlers({
       switch (msg.kind) {
         case 'complete': {
           // Flush any remaining streaming state
-          if (streamTimerRef.current) {
-            clearTimeout(streamTimerRef.current);
-            streamTimerRef.current = null;
+          const stream = sid ? streamStateRef.current.get(sid) : undefined;
+          if (stream?.timer !== null && stream?.timer !== undefined) {
+            clearTimeout(stream.timer);
           }
-          if (sid && accumulatedStreamRef.current) {
-            sessionStore.updateStreaming(sid, accumulatedStreamRef.current, provider);
+          if (sid && stream?.text) {
+            sessionStore.updateStreaming(sid, stream.text, stream.provider);
             sessionStore.finalizeStreaming(sid);
           }
-          accumulatedStreamRef.current = '';
+          if (sid) streamStateRef.current.delete(sid);
 
           // `complete` is the unified terminal event — every provider run ends
           // with exactly one, regardless of success, failure, or abort. The
           // indicator derives from the processing map, so deleting the entry
           // hides it immediately and atomically.
+          if (sid) {
+            onChatRunComplete?.(sid);
+          }
           onSessionIdle?.(sid);
           if (sid === activeViewSessionId) {
             pendingPermissionRequestsRef.current = [];
@@ -336,12 +486,18 @@ export function useChatRealtimeHandlers({
     setTokenBudget,
     pendingPermissionRequests,
     setPendingPermissionRequests,
-    streamTimerRef,
-    accumulatedStreamRef,
+    streamStateRef,
     lastSeqRef,
+    runIdRef,
     statusCheckSentAtRef,
     onSessionProcessing,
     onSessionIdle,
+    onAutomationState,
+    onAutomationInputAck,
+    onChatRequestRejected,
+    onChatRunComplete,
+    onAutomationCommandObserved,
+    hasPendingAutomationInput,
     onWebSocketReconnect,
     sessionStore,
   ]);

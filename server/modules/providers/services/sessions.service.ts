@@ -5,6 +5,7 @@ import path from 'node:path';
 import { projectsDb, sessionsDb } from '@/modules/database/index.js';
 import { chatRunRegistry } from '@/modules/websocket/index.js';
 import { providerRegistry } from '@/modules/providers/provider.registry.js';
+import { cleanupSessionRuntimeBeforeDeletion } from '@/modules/providers/services/session-runtime-cleanup.service.js';
 import type {
   FetchHistoryOptions,
   FetchHistoryResult,
@@ -253,6 +254,8 @@ export const sessionsService = {
         deletedFromDisk: false,
       };
     }
+
+    await cleanupSessionRuntimeBeforeDeletion(sessionId);
 
     let removedFromDisk = false;
     if (options.deletedFromDisk && session.jsonl_path) {

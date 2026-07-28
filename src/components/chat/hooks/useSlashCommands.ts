@@ -12,7 +12,7 @@ export interface SlashCommand {
   description?: string;
   namespace?: string;
   path?: string;
-  type?: 'built-in' | 'custom' | 'skill' | string;
+  type?: 'built-in' | 'custom' | 'skill' | 'passthrough' | string;
   metadata?: Record<string, unknown>;
   [key: string]: unknown;
 }
@@ -68,6 +68,27 @@ const isPromiseLike = (value: unknown): value is Promise<unknown> =>
 
 const isSkillCommand = (command: SlashCommand) =>
   command.type === 'skill' || command.metadata?.type === 'skill';
+
+const isInputCommand = (command: SlashCommand) =>
+  isSkillCommand(command) || command.type === 'passthrough';
+
+// These commands are parsed by the chat gateway and must remain normal chat.send messages.
+const CLAUDE_AUTOMATION_COMMANDS: SlashCommand[] = [
+  {
+    name: '/goal',
+    description: 'Keep working until a verifiable goal is complete',
+    namespace: 'builtin',
+    type: 'passthrough',
+    metadata: { type: 'Claude Code' },
+  },
+  {
+    name: '/loop',
+    description: 'Run a prompt repeatedly on a schedule',
+    namespace: 'builtin',
+    type: 'passthrough',
+    metadata: { type: 'Claude Code' },
+  },
+];
 
 const dedupeProviderSkills = (skills: ProviderSkill[]): ProviderSkill[] => {
   const seenCommands = new Set<string>();
@@ -207,12 +228,17 @@ export function useSlashCommands({
           : null;
         const skillCommands = dedupeProviderSkills(skillsData?.data?.skills || [])
           .map(mapSkillToSlashCommand);
+        const passthroughCommands = provider === 'claude' ? CLAUDE_AUTOMATION_COMMANDS : [];
+        const passthroughNames = new Set(passthroughCommands.map((command) => command.name));
         const allCommands: SlashCommand[] = [
-          ...((data.builtIn || []) as SlashCommand[]).map((command) => ({
-            ...command,
-            type: 'built-in',
-          })),
-          ...skillCommands,
+          ...passthroughCommands,
+          ...((data.builtIn || []) as SlashCommand[])
+            .filter((command) => !passthroughNames.has(command.name))
+            .map((command) => ({
+              ...command,
+              type: 'built-in',
+            })),
+          ...skillCommands.filter((command) => !passthroughNames.has(command.name)),
           ...((data.custom || []) as SlashCommand[]).map((command) => ({
             ...command,
             type: 'custom',
@@ -232,7 +258,7 @@ export function useSlashCommands({
       } catch (error) {
         console.error('Error fetching slash commands:', error);
         if (!cancelled) {
-          setSlashCommands([]);
+          setSlashCommands(provider === 'claude' ? CLAUDE_AUTOMATION_COMMANDS : []);
         }
       }
     };
@@ -332,7 +358,7 @@ export function useSlashCommands({
 
   const selectCommandFromKeyboard = useCallback(
     (command: SlashCommand) => {
-      if (isSkillCommand(command)) {
+      if (isInputCommand(command)) {
         insertCommandIntoInput(command);
         return;
       }
@@ -354,7 +380,7 @@ export function useSlashCommands({
       }
 
       trackCommandUsage(command);
-      if (isSkillCommand(command)) {
+      if (isInputCommand(command)) {
         insertCommandIntoInput(command);
         return;
       }

@@ -56,6 +56,7 @@
 
 - **Responsive Design** - Works seamlessly across desktop, tablet, and mobile so you can also use Agents from mobile 
 - **Interactive Chat Interface** - Built-in chat interface for seamless communication with the Agents
+- **Native Claude Automations** - Start `/goal` and `/loop` from normal web chat, keep them running after the browser closes, and stop or dismiss them from the conversation
 - **Integrated Shell Terminal** - Direct access to the Agents CLI through built-in shell functionality
 - **File Explorer** - Interactive file tree with syntax highlighting and live editing
 - **Git Explorer** - View, stage and commit your changes. You can also switch branches 
@@ -92,6 +93,8 @@ cloudcli
 ```
 
 Open `http://localhost:3001` — all your existing sessions are discovered automatically.
+
+Native `/goal` and `/loop` require Claude Code 2.1.145 or newer. `/loop` also requires `tmux` on macOS or Linux and an unattended Claude permission mode (`auto`, `bypassPermissions`, or `dontAsk`). Plan mode is intentionally rejected because its hidden approval prompt can block a detached terminal. On macOS and Linux, `/goal` runs in a supervised process group: closing the browser does not interrupt it, and an unexpected CloudCLI server exit triggers whole-process-tree cleanup that is verified during startup recovery. Windows uses a direct child process for `/goal`, so browser-close behavior is supported, but forced descendant-process cleanup after a server crash is not guaranteed. `/loop` runs in detached tmux and is recovered after a CloudCLI restart; its environment is handed off through a one-time local socket and is not persisted to disk. Native `/loop` is not available on Windows.
 
 Visit the **[documentation →](https://cloudcli.ai/docs)** for full configuration options, PM2, remote server setup and more.
 

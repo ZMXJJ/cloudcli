@@ -2,6 +2,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
 import { projectsDb, sessionsDb } from '@/modules/database/index.js';
+import { cleanupSessionRuntimeBeforeDeletion } from '@/modules/providers/index.js';
 import { AppError } from '@/shared/utils.js';
 
 function uniqueJsonlPathsFromSessions(
@@ -67,6 +68,11 @@ export async function deleteOrArchiveProject(projectId: string, force: boolean):
   if (!force) {
     projectsDb.updateProjectIsArchivedById(projectId, true);
     return;
+  }
+
+  const sessions = sessionsDb.getSessionsByProjectPathIncludingArchived(row.project_path);
+  for (const session of sessions) {
+    await cleanupSessionRuntimeBeforeDeletion(session.session_id);
   }
 
   await deleteSessionJsonlFilesForProjectPath(row.project_path);

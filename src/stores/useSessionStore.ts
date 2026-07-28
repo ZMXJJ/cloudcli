@@ -12,6 +12,8 @@ import { useCallback, useMemo, useRef, useState } from 'react';
 import { authenticatedFetch } from '../utils/api';
 import type { LLMProvider } from '../types/app';
 
+import { reconcileOlderPage, reconcileTailPage } from './sessionStorePagination';
+
 // ─── NormalizedMessage (mirrors server/adapters/types.js) ────────────────────
 
 export type MessageKind =
@@ -42,6 +44,8 @@ export interface NormalizedMessage {
    * REST history messages do not carry it.
    */
   seq?: number;
+  /** Stable generation id for the provider run that owns `seq`. */
+  runId?: string;
 
   // kind-specific fields (flat for simplicity)
   role?: 'user' | 'assistant';
@@ -425,6 +429,8 @@ const STALE_THRESHOLD_MS = 30_000;
 
 const MAX_REALTIME_MESSAGES = 500;
 
+const TAIL_REFRESH_LIMIT = 20;
+
 // ─── Hook ────────────────────────────────────────────────────────────────────
 
 export function useSessionStore() {
@@ -525,7 +531,7 @@ export function useSessionStore() {
   }, [getSlot, notify]);
 
   /**
-   * Load older (paginated) messages and prepend to serverMessages.
+   * Load the next older page and insert it before the contiguous tail.
    */
   const fetchMore = useCallback(async (
     sessionId: string,
@@ -559,10 +565,17 @@ export function useSessionStore() {
       }
       slot._appliedFetchSeq = fetchTicket;
 
-      // Prepend older messages (they're earlier in the conversation)
-      slot.serverMessages = [...olderMessages, ...slot.serverMessages];
-      slot.hasMore = Boolean(data.hasMore);
-      slot.offset = slot.offset + olderMessages.length;
+      const total = data.total ?? slot.total;
+      const reconciled = reconcileOlderPage(
+        slot.serverMessages,
+        olderMessages,
+        slot.offset,
+        total,
+      );
+      slot.serverMessages = reconciled.messages;
+      slot.total = total;
+      slot.hasMore = reconciled.hasMore;
+      slot.offset = reconciled.offset;
       recomputeMergedIfNeeded(slot);
       notify(sessionId);
       return slot;
@@ -637,7 +650,8 @@ export function useSessionStore() {
 
       slot.serverMessages = data.messages || [];
       slot.total = data.total ?? slot.serverMessages.length;
-      slot.hasMore = Boolean(data.hasMore);
+      slot.offset = Math.min(slot.total, slot.serverMessages.length);
+      slot.hasMore = slot.offset < slot.total;
       slot.fetchedAt = Date.now();
       // Only drop realtime rows the server transcript now owns. A blind clear
       // here caused the chat pane to flash "Continue your conversation" after
@@ -650,6 +664,61 @@ export function useSessionStore() {
       notify(sessionId);
     } catch (error) {
       console.error(`[SessionStore] refresh failed for ${sessionId}:`, error);
+    }
+  }, [getSlot, notify]);
+
+  /**
+   * Refresh only the newest transcript page while preserving older pages that
+   * are already loaded in this session slot.
+   */
+  const refreshTailFromServer = useCallback(async (sessionId: string) => {
+    const slot = getSlot(sessionId);
+    const fetchTicket = ++slot._fetchSeq;
+    try {
+      const params = new URLSearchParams({
+        limit: String(TAIL_REFRESH_LIMIT),
+        offset: '0',
+      });
+      const url = `/api/providers/sessions/${encodeURIComponent(sessionId)}/messages?${params}`;
+      const response = await authenticatedFetch(url);
+
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const body = await response.json();
+      const data = body?.data ?? body;
+      const tailMessages: NormalizedMessage[] = data.messages || [];
+
+      if (fetchTicket <= slot._appliedFetchSeq) {
+        return slot;
+      }
+      slot._appliedFetchSeq = fetchTicket;
+
+      const total = data.total ?? Math.max(slot.total, tailMessages.length);
+      const reconciled = reconcileTailPage(
+        slot.serverMessages,
+        tailMessages,
+        slot.offset,
+        total,
+        slot.total,
+      );
+      slot.serverMessages = reconciled.messages;
+      slot.total = total;
+      slot.hasMore = reconciled.hasMore;
+      slot.offset = reconciled.offset;
+      slot.fetchedAt = Date.now();
+      slot.status = 'idle';
+      if (data.tokenUsage) {
+        slot.tokenUsage = data.tokenUsage;
+      }
+      slot.realtimeMessages = pruneRealtimeSupersededByServer(
+        slot.serverMessages,
+        slot.realtimeMessages,
+      );
+      recomputeMergedIfNeeded(slot);
+      notify(sessionId);
+      return slot;
+    } catch (error) {
+      console.error(`[SessionStore] tail refresh failed for ${sessionId}:`, error);
+      return slot;
     }
   }, [getSlot, notify]);
 
@@ -754,6 +823,7 @@ export function useSessionStore() {
     appendRealtime,
     appendRealtimeBatch,
     refreshFromServer,
+    refreshTailFromServer,
     setActiveSession,
     setStatus,
     isStale,
@@ -764,7 +834,7 @@ export function useSessionStore() {
     getSessionSlot,
   }), [
     getSlot, has, fetchFromServer, fetchMore,
-    appendRealtime, appendRealtimeBatch, refreshFromServer,
+    appendRealtime, appendRealtimeBatch, refreshFromServer, refreshTailFromServer,
     setActiveSession, setStatus, isStale, updateStreaming, finalizeStreaming,
     clearRealtime, getMessages, getSessionSlot,
   ]);

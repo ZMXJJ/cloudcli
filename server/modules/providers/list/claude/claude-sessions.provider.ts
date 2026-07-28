@@ -640,15 +640,14 @@ export class ClaudeSessionsProvider implements IProviderSessions {
       }
     }
 
-    let total = 0;
-    for (const msg of normalized) {
-      if (msg.kind !== 'tool_result') {
-        total += 1;
-      }
-    }
+    // Tool results are already attached to their tool_use above and are not a
+    // standalone row in the UI. Paginate and count the same visible sequence;
+    // otherwise result-heavy histories drift across page boundaries.
+    const pageable = normalized.filter((message) => message.kind !== 'tool_result');
+    const total = pageable.length;
     const normalizedOffset = Math.max(0, offset);
     const normalizedLimit = limit === null ? null : Math.max(0, limit);
-    const { page, hasMore } = sliceTailPage(normalized, normalizedLimit, normalizedOffset);
+    const { page, hasMore } = sliceTailPage(pageable, normalizedLimit, normalizedOffset);
 
     return {
       messages: page,

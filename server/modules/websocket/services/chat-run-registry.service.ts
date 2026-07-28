@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 
 import { projectsDb, sessionsDb } from '@/modules/database/index.js';
@@ -27,6 +28,7 @@ type ChatRunStatus = 'running' | 'completed';
  *   can replay exactly the events it missed via `chat.subscribe`.
  */
 type ChatRun = {
+  runId: string;
   appSessionId: string;
   provider: LLMProvider;
   providerSessionId: string | null;
@@ -104,11 +106,13 @@ async function broadcastCanonicalSessionUpsert(appSessionId: string): Promise<vo
   });
 }
 
-function evictRunLater(appSessionId: string): void {
+function evictRunLater(completedRun: ChatRun): void {
   const timer = setTimeout(() => {
-    const run = runs.get(appSessionId);
-    if (run && run.status === 'completed') {
-      runs.delete(appSessionId);
+    if (
+      runs.get(completedRun.appSessionId) === completedRun
+      && completedRun.status === 'completed'
+    ) {
+      runs.delete(completedRun.appSessionId);
     }
   }, COMPLETED_RUN_RETENTION_MS);
 
@@ -127,11 +131,10 @@ function evictRunLater(appSessionId: string): void {
  * 4. Flip the run to `completed` when the terminal `complete` event passes by.
  */
 function decorateAndRecordEvent(run: ChatRun, message: NormalizedMessage): NormalizedMessage | null {
-  // Exactly-one-complete contract: when a run is aborted the chat handler
-  // emits the terminal `complete` immediately, but the killed runtime may
-  // still emit its own `complete` from its exit handler moments later.
-  // Whichever arrives first wins; the duplicate is dropped here.
-  if (message.kind === 'complete' && run.status === 'completed') {
+  // A terminal event invalidates the writer. Killed runtimes can still emit
+  // buffered text/status/error frames after abort; forwarding those would
+  // corrupt the next run's transcript and replay cursor.
+  if (run.status === 'completed') {
     return null;
   }
 
@@ -140,6 +143,7 @@ function decorateAndRecordEvent(run: ChatRun, message: NormalizedMessage): Norma
   const outbound: NormalizedMessage = {
     ...message,
     sessionId: run.appSessionId,
+    runId: run.runId,
     seq: run.lastSeq,
   };
 
@@ -149,7 +153,7 @@ function decorateAndRecordEvent(run: ChatRun, message: NormalizedMessage): Norma
     outbound.actualSessionId = run.appSessionId;
     run.status = 'completed';
     run.completedAt = Date.now();
-    evictRunLater(run.appSessionId);
+    evictRunLater(run);
   }
 
   run.events.push(outbound);
@@ -170,7 +174,12 @@ function decorateAndRecordEvent(run: ChatRun, message: NormalizedMessage): Norma
  * happens first wins; later calls with the same id are no-ops.
  */
 function recordProviderSessionId(run: ChatRun, providerSessionId: string): void {
-  if (!providerSessionId || run.providerSessionId === providerSessionId) {
+  if (
+    !providerSessionId
+    || run.providerSessionId === providerSessionId
+    || run.status !== 'running'
+    || runs.get(run.appSessionId) !== run
+  ) {
     return;
   }
 
@@ -222,6 +231,7 @@ export const chatRunRegistry = {
     }
 
     const run: ChatRun = {
+      runId: randomUUID(),
       appSessionId: input.appSessionId,
       provider: input.provider,
       providerSessionId: input.providerSessionId,
@@ -272,13 +282,7 @@ export const chatRunRegistry = {
       }));
   },
 
-  /**
-   * Re-attaches a run's outbound stream to a (new) websocket connection.
-   *
-   * This is the generic replacement for the Claude-only writer reconnect:
-   * after a page refresh the new socket subscribes and immediately starts
-   * receiving the still-running stream, for every provider.
-   */
+  /** Adds a subscribed websocket to a run's outbound stream. */
   attachConnection(appSessionId: string, connection: RealtimeClientConnection): boolean {
     const run = runs.get(appSessionId);
     if (!run) {

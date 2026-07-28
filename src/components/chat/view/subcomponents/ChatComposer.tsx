@@ -17,7 +17,7 @@ import { useVoiceInput } from '../../hooks/useVoiceInput';
 import { useVoiceAvailable } from '../../hooks/useVoiceAvailable';
 import type { QueuedDraft } from '../../hooks/useChatComposerState';
 import type { SessionActivity } from '../../../../hooks/useSessionProtection';
-import type { PendingPermissionRequest, PermissionMode } from '../../types/types';
+import type { ChatAutomation, PendingPermissionRequest, PermissionMode } from '../../types/types';
 import type { ProviderModelOption } from '../../../../types/app';
 import {
   PromptInput,
@@ -32,6 +32,7 @@ import {
 
 import CommandMenu from './CommandMenu';
 import ActivityIndicator from './ActivityIndicator';
+import AutomationStatusBar from './AutomationStatusBar';
 import ImageAttachment from './ImageAttachment';
 import VoiceInputButton from './VoiceInputButton';
 import PermissionRequestsBanner from './PermissionRequestsBanner';
@@ -54,6 +55,10 @@ interface SlashCommand {
 }
 
 interface ChatComposerProps {
+  automation: ChatAutomation | null;
+  automationControlError?: string | null;
+  onStopAutomation: () => void;
+  onDismissAutomation: () => void;
   pendingPermissionRequests: PendingPermissionRequest[];
   handlePermissionDecision: (
     requestIds: string | string[],
@@ -115,6 +120,10 @@ interface ChatComposerProps {
 }
 
 export default function ChatComposer({
+  automation,
+  automationControlError,
+  onStopAutomation,
+  onDismissAutomation,
   pendingPermissionRequests,
   handlePermissionDecision,
   handleGrantToolPermission,
@@ -298,6 +307,15 @@ export default function ChatComposer({
         <div className="pointer-events-none absolute bottom-full left-1/2 z-10 w-[calc(100%-1rem)] max-w-[54.25rem] -translate-x-1/2 translate-y-px bg-transparent sm:w-[calc(100%-2rem)]">
           <ActivityIndicator activity={activity} onAbort={onAbortSession} isInputFocused={isInputFocused} />
         </div>
+      )}
+
+      {automation && (
+        <AutomationStatusBar
+          automation={automation}
+          controlError={automationControlError}
+          onStop={onStopAutomation}
+          onDismiss={onDismissAutomation}
+        />
       )}
 
       {pendingPermissionRequests.length > 0 && (

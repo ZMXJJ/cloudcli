@@ -33,7 +33,7 @@ Benefits:
 |---|---|
 | `services/websocket-server.service.ts` | Creates `WebSocketServer`, binds `verifyClient`, routes connection by pathname |
 | `services/websocket-auth.service.ts` | Authenticates upgrade requests and attaches `request.user` |
-| `services/chat-websocket.service.ts` | Handles the `/ws` chat protocol (`chat.send` / `chat.abort` / `chat.subscribe` / `chat.permission-response`) |
+| `services/chat-websocket.service.ts` | Handles the `/ws` chat protocol, including native Claude Goal/Loop control |
 | `services/chat-run-registry.service.ts` | Tracks live provider runs per app session id: seq numbering, event replay buffer, provider-id mapping, completion state |
 | `services/chat-session-writer.service.ts` | Gateway writer handed to provider runtimes: remaps provider session ids to app ids, swallows `session_created`, assigns `seq` |
 | `services/shell-websocket.service.ts` | Handles `/shell` PTY lifecycle, reconnect buffering, auth URL detection |
@@ -108,8 +108,8 @@ When a chat socket connects:
 
 1. Add socket to `connectedClients`.
 2. Parse each incoming message with `parseIncomingJsonObject`.
-3. Dispatch by `data.type` (four message types, none provider-specific).
-4. On close, remove socket from `connectedClients`.
+3. Dispatch by `data.type`; native Claude automations are routed behind the same chat protocol.
+4. On close, remove the socket from `connectedClients` and its chat subscriptions.
 
 ### Session identity model
 
@@ -129,19 +129,27 @@ flowchart TD
   B -->|invalid| C[send kind:protocol_error]
   B -->|ok| D{data.type}
 
-  D -->|chat.send| E[resolve session row -> startRun -> spawnFns provider]
-  D -->|chat.abort| F[abortFns provider + synthetic complete]
-  D -->|chat.subscribe| G[chat_subscribed ack + attach socket + replay events seq > lastSeq]
+  D -->|chat.send| E{Claude automation command or active Loop?}
+  E -->|no| J[resolve session row -> startRun -> spawnFns provider]
+  E -->|Goal| K[headless native Claude -> normalized run stream]
+  E -->|Loop| L[detached tmux session or correlated tmux input]
+  D -->|chat.abort| F[stop active Goal or abort provider + synthetic complete]
+  D -->|chat.subscribe| G[chat_subscribed ack + automation snapshot + replay]
   D -->|chat.permission-response| H[resolveToolApproval]
+  D -->|automation.stop| M[interrupt Goal or cancel and stop tmux Loop]
+  D -->|automation.dismiss| N[remove terminal automation status]
   D -->|other| I[send kind:protocol_error]
 ```
 
 ### Chat Notes
 
-1. **Unified envelope**: every server-to-client frame carries a `kind` — either a provider `NormalizedMessage` kind or a gateway kind (`chat_subscribed`, `session_upserted`, `loading_progress`, `protocol_error`). There is no second `type`-based protocol.
+1. **Unified envelope**: every server-to-client frame carries a `kind` — either a provider `NormalizedMessage` kind or a gateway kind (`chat_subscribed`, `automation_state`, `automation_input_ack`, `session_upserted`, `loading_progress`, `protocol_error`). There is no second `type`-based protocol.
 2. **Unified terminal lifecycle**: every provider run ends with exactly one `complete` message built by `createCompleteMessage()` (`server/shared/utils.ts`): `{ kind: "complete", sessionId, actualSessionId, exitCode, success, aborted }`. The chat handler emits a synthetic `complete` for runs that crash or get aborted, and the run registry drops duplicate completes.
 3. **Per-run event log**: every live event gets a monotonically increasing `seq`. `chat.subscribe { sessions: [{ sessionId, lastSeq }] }` re-attaches the live stream to the requesting socket (any provider, not just Claude) and replays events with `seq > lastSeq`. If the buffer no longer covers `lastSeq`, the client refreshes over REST.
-4. `chat_subscribed` includes `isProcessing` (replaces `check-session-status`) and `pendingPermissions` (replaces `get-pending-permissions`).
+4. `chat_subscribed` includes `isProcessing`, `pendingPermissions`, and the persisted `automation` snapshot (or `null`).
+5. **Browser-independent automations**: Goal runs as a server-owned headless Claude process and Loop runs in detached tmux. Closing the browser only detaches the WebSocket; it does not stop either runtime. Goal events remain in the run replay buffer, while Loop transcript changes are picked up by the provider session watcher.
+6. **Generation-safe Loop input**: normal messages sent to a running Loop carry both `requestId` and `automationId`. Success returns `automation_input_ack` with the same pair; failures return a correlated `protocol_error`. Stop and Dismiss also require the current `automationId`, so a stale tab cannot act on a replacement automation.
+7. **Request-correlated automation commands**: state changes are broadcast to every subscribed tab without a `requestId`. Successful detached `chat.send` commands also receive a direct `automation_state` confirmation on the initiating socket with their original `requestId`, so concurrent Start, Status, and Stop requests settle independently.
 
 ## `/shell` Terminal Flow
 
@@ -258,7 +266,7 @@ Current explicit close codes in this module:
 
 Other errors:
 
-1. Chat handler catches and emits `{ kind: "protocol_error", code, error }`.
+1. Chat handler catches and emits `{ kind: "protocol_error", code, error, requestId, automationId, preserveProcessing }`; request fields are `null` when the failed action was not correlated.
 2. Shell handler catches and writes terminal-visible error output.
 3. Unknown websocket paths are closed immediately.
 

@@ -2,6 +2,18 @@ export { initializeDatabase } from '@/modules/database/init-db.js';
 export { closeConnection, getConnection, getDatabasePath } from '@/modules/database/connection.js';
 export { apiKeysDb } from '@/modules/database/repositories/api-keys.js';
 export { appConfigDb } from '@/modules/database/repositories/app-config.js';
+export {
+  claudeAutomationsDb,
+  type ClaudeAutomationKind,
+  type ClaudeAutomationInputRow,
+  type ClaudeAutomationInputState,
+  type ClaudeAutomationRow,
+  type ClaudeAutomationRuntime,
+  type ClaudeAutomationState,
+  type StartClaudeAutomationInput,
+  type ReserveClaudeAutomationInput,
+  type UpdateClaudeAutomationInput,
+} from '@/modules/database/repositories/claude-automations.db.js';
 export { credentialsDb } from '@/modules/database/repositories/credentials.js';
 export { githubTokensDb } from '@/modules/database/repositories/github-tokens.js';
 export { notificationChannelEndpointsDb } from '@/modules/database/repositories/notification-channel-endpoints.js';
