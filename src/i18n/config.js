@@ -4,15 +4,13 @@
  * Configures i18next for internationalization support.
  * Features:
  * - Lazy-loading of translation namespaces
- * - Language detection from localStorage
+ * - System-language detection with a persisted manual override
  * - Fallback to English for missing translations
  * - Development mode warnings for missing keys
  */
 
 import i18n from 'i18next';
 import { initReactI18next } from 'react-i18next';
-// eslint-disable-next-line import-x/order
-import LanguageDetector from 'i18next-browser-languagedetector';
 
 // Import translation resources
 import enCommon from './locales/en/common.json';
@@ -23,6 +21,15 @@ import enChat from './locales/en/chat.json';
 import enCodeEditor from './locales/en/codeEditor.json';
 // eslint-disable-next-line import-x/order
 import enTasks from './locales/en/tasks.json';
+
+import frCommon from './locales/fr/common.json';
+import frSettings from './locales/fr/settings.json';
+import frAuth from './locales/fr/auth.json';
+import frSidebar from './locales/fr/sidebar.json';
+import frChat from './locales/fr/chat.json';
+import frCodeEditor from './locales/fr/codeEditor.json';
+// eslint-disable-next-line import-x/order
+import frTasks from './locales/fr/tasks.json';
 
 import koCommon from './locales/ko/common.json';
 import koSettings from './locales/ko/settings.json';
@@ -95,24 +102,10 @@ import zhTWTasks from './locales/zh-TW/tasks.json';
 
 // Import supported languages configuration
 import { languages } from './languages.js';
-
-// Get saved language preference from localStorage
-const getSavedLanguage = () => {
-  try {
-    const saved = localStorage.getItem('userLanguage');
-    // Validate that the saved language is supported
-    if (saved && languages.some(lang => lang.value === saved)) {
-      return saved;
-    }
-    return 'en';
-  } catch {
-    return 'en';
-  }
-};
+import { getInitialLanguage } from './languagePreference';
 
 // Initialize i18next
 i18n
-  .use(LanguageDetector) // Detect user language
   .use(initReactI18next) // Pass i18n instance to react-i18next
   .init({
     // Resources containing all translations
@@ -125,6 +118,15 @@ i18n
         chat: enChat,
         codeEditor: enCodeEditor,
         tasks: enTasks,
+      },
+      fr: {
+        common: frCommon,
+        settings: frSettings,
+        auth: frAuth,
+        sidebar: frSidebar,
+        chat: frChat,
+        codeEditor: frCodeEditor,
+        tasks: frTasks,
       },
       ko: {
         common: koCommon,
@@ -198,8 +200,10 @@ i18n
       },
     },
 
-    // Default language
-    lng: getSavedLanguage(),
+    // Follow the system language unless the user explicitly selected one.
+    lng: getInitialLanguage(),
+
+    supportedLngs: languages.map(({ value }) => value),
 
     // Fallback language when a translation is missing
     fallbackLng: 'en',
@@ -232,26 +236,6 @@ i18n
       bindI18nStore: false, // Don't re-render on resource changes
     },
 
-    // Detection options
-    detection: {
-      // Order of language detection (local storage first)
-      order: ['localStorage'],
-
-      // Keys to look for in localStorage
-      lookupLocalStorage: 'userLanguage',
-
-      // Cache user language
-      caches: ['localStorage'],
-    },
   });
-
-// Save language preference when it changes
-i18n.on('languageChanged', (lng) => {
-  try {
-    localStorage.setItem('userLanguage', lng);
-  } catch (error) {
-    console.error('Failed to save language preference:', error);
-  }
-});
 
 export default i18n;

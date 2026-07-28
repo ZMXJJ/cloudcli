@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { Languages } from 'lucide-react';
 
 import { languages } from '../../../i18n/languages';
+import { saveManualLanguagePreference } from '../../../i18n/languagePreference';
 
 type LanguageSelectorProps = {
   compact?: boolean;
@@ -23,7 +24,8 @@ export default function LanguageSelector({ compact = false }: LanguageSelectorPr
 
   const handleLanguageChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
     const newLanguage = event.target.value;
-    i18n.changeLanguage(newLanguage);
+    saveManualLanguagePreference(newLanguage);
+    void i18n.changeLanguage(newLanguage);
   };
 
   // Compact style for QuickSettingsPanel
