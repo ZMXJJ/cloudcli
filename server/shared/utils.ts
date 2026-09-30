@@ -102,6 +102,29 @@ export class AppError extends Error {
   }
 }
 
+export const LLM_PROVIDERS: readonly LLMProvider[] = ['claude', 'codex', 'cursor', 'opencode'];
+
+const LLM_PROVIDER_SET = new Set<string>(LLM_PROVIDERS);
+
+/** Parses the comma-separated provider filter used by sidebar list APIs. */
+export function parseProviderFilter(value: unknown): LLMProvider[] | undefined {
+  const rawValue = Array.isArray(value) ? value[0] : value;
+  if (typeof rawValue !== 'string' || !rawValue.trim()) {
+    return undefined;
+  }
+
+  const providers = [...new Set(rawValue.split(',').map((entry) => entry.trim().toLowerCase()))];
+  const invalidProvider = providers.find((provider) => !LLM_PROVIDER_SET.has(provider));
+  if (invalidProvider) {
+    throw new AppError(`Unsupported provider "${invalidProvider}".`, {
+      code: 'INVALID_PROVIDER_FILTER',
+      statusCode: 400,
+    });
+  }
+
+  return providers as LLMProvider[];
+}
+
 // ---------------------------
 //----------------- WORKSPACE PATH VALIDATION UTILITIES ------------
 /**
@@ -1283,4 +1306,3 @@ export function flattenPromptForWindowsShell(prompt: string): string {
   }
   return prompt.replace(/\s*\r?\n\s*/g, ' ').trim();
 }
-

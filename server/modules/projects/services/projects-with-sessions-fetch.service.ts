@@ -4,7 +4,7 @@ import path from 'node:path';
 import { projectsDb, sessionsDb } from '@/modules/database/index.js';
 import { sessionSynchronizerService } from '@/modules/providers/index.js';
 import { WS_OPEN_STATE, connectedClients } from '@/modules/websocket/index.js';
-import type { RealtimeClientConnection } from '@/shared/types.js';
+import type { LLMProvider, RealtimeClientConnection } from '@/shared/types.js';
 import { AppError } from '@/shared/utils.js';
 
 type SessionSummary = {
@@ -29,6 +29,7 @@ export type ProjectListItem = {
   displayName: string;
   fullPath: string;
   isStarred: boolean;
+  providerCounts: Partial<Record<LLMProvider, number>>;
   sessions: SessionSummary[];
   sessionMeta: {
     hasMore: boolean;
@@ -51,11 +52,13 @@ type GetProjectsWithSessionsOptions = {
   skipSynchronization?: boolean;
   sessionsLimit?: number;
   sessionsOffset?: number;
+  providers?: readonly LLMProvider[];
 };
 
 type SessionPaginationOptions = {
   limit?: number;
   offset?: number;
+  providers?: readonly LLMProvider[];
 };
 
 type ProjectSessionsPageResult = {
@@ -127,8 +130,11 @@ function mapSessionRowToSummary(row: SessionRepositoryRow): SessionSummary {
   };
 }
 
-function readProjectSessionsIncludingArchived(projectPath: string): ProjectSessionsPageResult {
-  const rows = sessionsDb.getSessionsByProjectPathIncludingArchived(projectPath) as SessionRepositoryRow[];
+function readProjectSessionsIncludingArchived(
+  projectPath: string,
+  providers?: readonly LLMProvider[],
+): ProjectSessionsPageResult {
+  const rows = sessionsDb.getSessionsByProjectPathIncludingArchived(projectPath, providers) as SessionRepositoryRow[];
 
   return {
     sessions: rows.map(mapSessionRowToSummary),
@@ -149,8 +155,9 @@ function readProjectSessionsPageByPath(
     projectPath,
     pagination.limit,
     pagination.offset,
+    options.providers,
   ) as SessionRepositoryRow[];
-  const total = sessionsDb.countSessionsByProjectPath(projectPath);
+  const total = sessionsDb.countSessionsByProjectPath(projectPath, options.providers);
 
   return {
     sessions: rows.map(mapSessionRowToSummary),
@@ -215,7 +222,12 @@ export async function getProjectsWithSessions(
     const sessionsPage = readProjectSessionsPageByPath(projectPath, {
       limit: options.sessionsLimit,
       offset: options.sessionsOffset,
+      providers: options.providers,
     });
+
+    if (options.providers && sessionsPage.total === 0) {
+      continue;
+    }
 
     projects.push({
       projectId,
@@ -223,6 +235,7 @@ export async function getProjectsWithSessions(
       displayName,
       fullPath: projectPath,
       isStarred: Boolean(row.isStarred),
+      providerCounts: sessionsDb.getProviderCountsByProjectPath(projectPath),
       sessions: sessionsPage.sessions,
       sessionMeta: {
         hasMore: sessionsPage.hasMore,
@@ -246,7 +259,7 @@ export async function getProjectsWithSessions(
  * conversation history in the archive view regardless of each session's flag.
  */
 export async function getArchivedProjectsWithSessions(
-  options: Pick<GetProjectsWithSessionsOptions, 'skipSynchronization'> = {},
+  options: Pick<GetProjectsWithSessionsOptions, 'skipSynchronization' | 'providers'> = {},
 ): Promise<ArchivedProjectListItem[]> {
   if (!options.skipSynchronization) {
     await sessionSynchronizerService.synchronizeSessions();
@@ -267,7 +280,10 @@ export async function getArchivedProjectsWithSessions(
         ? row.custom_project_name
         : await generateDisplayName(path.basename(row.project_path) || row.project_path, row.project_path);
 
-    const sessionsPage = readProjectSessionsIncludingArchived(row.project_path);
+    const sessionsPage = readProjectSessionsIncludingArchived(row.project_path, options.providers);
+    if (options.providers && sessionsPage.total === 0) {
+      continue;
+    }
 
     archivedProjects.push({
       projectId: row.project_id,
@@ -276,6 +292,7 @@ export async function getArchivedProjectsWithSessions(
       fullPath: row.project_path,
       isStarred: Boolean(row.isStarred),
       isArchived: true,
+      providerCounts: sessionsDb.getProviderCountsByProjectPath(row.project_path, { includeArchived: true }),
       sessions: sessionsPage.sessions,
       sessionMeta: {
         hasMore: sessionsPage.hasMore,

@@ -22,6 +22,7 @@ import {
   readProjectSortOrder,
   sortProjects,
 } from '../utils/utils';
+import { getProviderApiFilter } from '../../../utils/providerFilter';
 
 type SnippetHighlight = {
   start: number;
@@ -83,6 +84,7 @@ type UseSidebarControllerArgs = {
   selectedProject: Project | null;
   selectedSession: ProjectSession | null;
   activeSessions: SessionActivityMap;
+  selectedProviders: readonly LLMProvider[];
   isLoading: boolean;
   isMobile: boolean;
   t: TFunction;
@@ -103,6 +105,7 @@ export function useSidebarController({
   selectedProject,
   selectedSession: _selectedSession,
   activeSessions,
+  selectedProviders,
   isLoading,
   isMobile,
   t,
@@ -150,7 +153,7 @@ export function useSidebarController({
 
   const isSidebarCollapsed = !isMobile && !sidebarVisible;
   const activeSessionIds = useMemo(() => new Set(activeSessions.keys()), [activeSessions]);
-  const runningSessionsCount = activeSessionIds.size;
+  const providerApiFilter = useMemo(() => getProviderApiFilter(selectedProviders), [selectedProviders]);
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -231,8 +234,8 @@ export function useSidebarController({
 
     try {
       const [archivedProjectsResponse, archivedSessionsResponse] = await Promise.all([
-        api.archivedProjects(),
-        api.getArchivedSessions(),
+        api.archivedProjects(providerApiFilter),
+        api.getArchivedSessions(providerApiFilter),
       ]);
 
       if (!archivedProjectsResponse.ok) {
@@ -258,7 +261,7 @@ export function useSidebarController({
     } finally {
       setIsArchivedSessionsLoading(false);
     }
-  }, []);
+  }, [providerApiFilter]);
 
   useEffect(() => {
     if (migrationStartedRef.current) {
@@ -362,7 +365,7 @@ export function useSidebarController({
       return;
     }
 
-    const url = api.searchConversationsUrl(query);
+    const url = api.searchConversationsUrl(query, 50, providerApiFilter);
     const es = new EventSource(url);
     eventSourceRef.current = es;
 
@@ -426,7 +429,7 @@ export function useSidebarController({
         eventSourceRef.current = null;
       }
     };
-  }, [debouncedSearchQuery, searchMode]);
+  }, [debouncedSearchQuery, providerApiFilter, searchMode]);
 
   // All sidebar state keys (expanded, starred, loading, etc.) use the DB
   // `projectId` as their identifier after the migration.
@@ -612,6 +615,11 @@ export function useSidebarController({
       return acc;
     }, []);
   }, [activeSessionIds, sortedProjects]);
+
+  const runningSessionsCount = useMemo(
+    () => runningProjects.reduce((total, project) => total + getAllSessions(project).length, 0),
+    [runningProjects],
+  );
 
   const filteredProjects = useMemo(
     () => filterProjects(searchMode === 'running' ? runningProjects : sortedProjects, debouncedSearchQuery),

@@ -6,6 +6,9 @@ import { CLOUDCLI_WORDMARK_FONT_FAMILY } from '../../../../constants/branding';
 import { IS_PLATFORM } from '../../../../constants/config';
 import { cn } from '../../../../lib/utils';
 import type { SidebarSearchMode } from '../../types/types';
+import type { LLMProvider } from '../../../../types/app';
+
+import ProviderFilterMenu from './ProviderFilterMenu';
 
 const MOD_KEY =
   typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform) ? '⌘' : 'Ctrl';
@@ -18,6 +21,8 @@ type SidebarHeaderProps = {
   runningSessionsCount: number;
   archivedSessionsCount: number;
   isArchivedSessionsLoading: boolean;
+  selectedProviders: readonly LLMProvider[];
+  onSelectedProvidersChange: (providers: LLMProvider[]) => void;
   searchFilter: string;
   onSearchFilterChange: (value: string) => void;
   onClearSearchFilter: () => void;
@@ -38,6 +43,8 @@ export default function SidebarHeader({
   runningSessionsCount,
   archivedSessionsCount,
   isArchivedSessionsLoading,
+  selectedProviders,
+  onSelectedProvidersChange,
   searchFilter,
   onSearchFilterChange,
   onClearSearchFilter,
@@ -96,6 +103,11 @@ export default function SidebarHeader({
           )}
 
           <div className="flex flex-shrink-0 items-center gap-0.5">
+            <ProviderFilterMenu
+              selectedProviders={selectedProviders}
+              onChange={onSelectedProvidersChange}
+              t={t}
+            />
             <Button
               variant="ghost"
               size="sm"
@@ -256,6 +268,11 @@ export default function SidebarHeader({
           )}
 
           <div className="flex flex-shrink-0 gap-1.5">
+            <ProviderFilterMenu
+              selectedProviders={selectedProviders}
+              onChange={onSelectedProvidersChange}
+              t={t}
+            />
             <button
               className="flex h-8 w-8 items-center justify-center rounded-lg bg-muted/50 transition-all active:scale-95"
               onClick={onRefresh}

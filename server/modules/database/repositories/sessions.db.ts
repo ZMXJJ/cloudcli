@@ -1,5 +1,6 @@
 import { getConnection } from '@/modules/database/connection.js';
 import { projectsDb } from '@/modules/database/repositories/projects.db.js';
+import type { LLMProvider } from '@/shared/types.js';
 import { normalizeProjectPath } from '@/shared/utils.js';
 
 type SessionRow = {
@@ -56,6 +57,20 @@ function normalizeSessionRows(rows: SessionRow[]): SessionRow[] {
 function normalizeProjectPathForProvider(provider: string, projectPath: string): string {
   void provider;
   return normalizeProjectPath(projectPath);
+}
+
+function buildProviderSqlFilter(providers: readonly LLMProvider[] | undefined): {
+  clause: string;
+  params: LLMProvider[];
+} {
+  if (!providers || providers.length === 0) {
+    return { clause: '', params: [] };
+  }
+
+  return {
+    clause: ` AND provider IN (${providers.map(() => '?').join(', ')})`,
+    params: [...providers],
+  };
 }
 
 export const sessionsDb = {
@@ -294,15 +309,16 @@ export const sessionsDb = {
     return normalizeSessionRow(row) ?? null;
   },
 
-  getAllSessions(): SessionRow[] {
+  getAllSessions(providers?: readonly LLMProvider[]): SessionRow[] {
     const db = getConnection();
+    const providerFilter = buildProviderSqlFilter(providers);
     const rows = db
       .prepare(
         `SELECT ${SESSION_ROW_COLUMNS}
          FROM sessions
-         WHERE isArchived = 0`
+         WHERE isArchived = 0${providerFilter.clause}`
       )
-      .all() as SessionRow[];
+      .all(...providerFilter.params) as SessionRow[];
 
     return normalizeSessionRows(rows);
   },
@@ -311,16 +327,17 @@ export const sessionsDb = {
    * Archived rows are intentionally queried separately so the caller can render
    * them in a dedicated view without reintroducing them into active session lists.
    */
-  getArchivedSessions(): SessionRow[] {
+  getArchivedSessions(providers?: readonly LLMProvider[]): SessionRow[] {
     const db = getConnection();
+    const providerFilter = buildProviderSqlFilter(providers);
     const rows = db
       .prepare(
         `SELECT ${SESSION_ROW_COLUMNS}
          FROM sessions
-         WHERE isArchived = 1
+         WHERE isArchived = 1${providerFilter.clause}
          ORDER BY datetime(COALESCE(updated_at, created_at)) DESC, session_id DESC`
       )
-      .all() as SessionRow[];
+      .all(...providerFilter.params) as SessionRow[];
 
     return normalizeSessionRows(rows);
   },
@@ -344,56 +361,126 @@ export const sessionsDb = {
    * Permanent project deletion must see every session row for the path,
    * including archived ones, so their transcript files can be cleaned up.
    */
-  getSessionsByProjectPathIncludingArchived(projectPath: string): SessionRow[] {
+  getSessionsByProjectPathIncludingArchived(
+    projectPath: string,
+    providers?: readonly LLMProvider[],
+  ): SessionRow[] {
     const db = getConnection();
     const normalizedProjectPath = normalizeProjectPath(projectPath);
+    const providerFilter = buildProviderSqlFilter(providers);
     const rows = db
       .prepare(
         `SELECT ${SESSION_ROW_COLUMNS}
          FROM sessions
-         WHERE project_path = ?`
+         WHERE project_path = ?${providerFilter.clause}`
       )
-      .all(normalizedProjectPath) as SessionRow[];
+      .all(normalizedProjectPath, ...providerFilter.params) as SessionRow[];
 
     return normalizeSessionRows(rows);
   },
 
-  getSessionsByProjectPathPage(projectPath: string, limit: number, offset: number): SessionRow[] {
+  getSessionsByProjectPathPage(
+    projectPath: string,
+    limit: number,
+    offset: number,
+    providers?: readonly LLMProvider[],
+  ): SessionRow[] {
     const db = getConnection();
     const normalizedProjectPath = normalizeProjectPath(projectPath);
+    const providerFilter = buildProviderSqlFilter(providers);
     const rows = db
       .prepare(
         `SELECT ${SESSION_ROW_COLUMNS}
          FROM sessions
          WHERE project_path = ?
-           AND isArchived = 0
+           AND isArchived = 0${providerFilter.clause}
          ORDER BY datetime(COALESCE(updated_at, created_at)) DESC, session_id DESC
          LIMIT ? OFFSET ?`
       )
-      .all(normalizedProjectPath, limit, offset) as SessionRow[];
+      .all(normalizedProjectPath, ...providerFilter.params, limit, offset) as SessionRow[];
 
     return normalizeSessionRows(rows);
   },
 
-  countSessionsByProjectPath(projectPath: string): number {
+  countSessionsByProjectPath(projectPath: string, providers?: readonly LLMProvider[]): number {
     const db = getConnection();
     const normalizedProjectPath = normalizeProjectPath(projectPath);
+    const providerFilter = buildProviderSqlFilter(providers);
     const row = db
       .prepare(
         `SELECT COUNT(*) AS count
          FROM sessions
          WHERE project_path = ?
-           AND isArchived = 0`
+           AND isArchived = 0${providerFilter.clause}`
       )
-      .get(normalizedProjectPath) as { count: number } | undefined;
+      .get(normalizedProjectPath, ...providerFilter.params) as { count: number } | undefined;
 
     return Number(row?.count ?? 0);
+  },
+
+  getProviderCountsByProjectPath(
+    projectPath: string,
+    options: { includeArchived?: boolean } = {},
+  ): Partial<Record<LLMProvider, number>> {
+    const db = getConnection();
+    const normalizedProjectPath = normalizeProjectPath(projectPath);
+    const archiveClause = options.includeArchived ? '' : ' AND isArchived = 0';
+    const rows = db
+      .prepare(
+        `SELECT provider, COUNT(*) AS count
+         FROM sessions
+         WHERE project_path = ?${archiveClause}
+         GROUP BY provider`
+      )
+      .all(normalizedProjectPath) as Array<{ provider: LLMProvider; count: number }>;
+
+    return Object.fromEntries(rows.map((row) => [row.provider, Number(row.count)])) as Partial<Record<LLMProvider, number>>;
   },
 
   deleteSessionsByProjectPath(projectPath: string): void {
     const db = getConnection();
     const normalizedProjectPath = normalizeProjectPath(projectPath);
     db.prepare(`DELETE FROM sessions WHERE project_path = ?`).run(normalizedProjectPath);
+  },
+
+  /**
+   * Removes provider-owned index rows for generated project paths. A project
+   * row is removed only when this cleanup deleted at least one matching
+   * session and no sessions from any provider remain on that path.
+   */
+  pruneProviderSessionsForProjectPaths(
+    provider: string,
+    projectPaths: readonly string[],
+  ): { deletedSessions: number; deletedProjects: number } {
+    const db = getConnection();
+    const deleteSessions = db.prepare(`
+      DELETE FROM sessions
+      WHERE provider = ? AND project_path = ?
+    `);
+    const deleteEmptyProject = db.prepare(`
+      DELETE FROM projects
+      WHERE project_path = ?
+        AND NOT EXISTS (
+          SELECT 1 FROM sessions WHERE sessions.project_path = projects.project_path
+        )
+    `);
+
+    const prune = db.transaction(() => {
+      let deletedSessions = 0;
+      let deletedProjects = 0;
+
+      for (const projectPath of new Set(projectPaths.map((entry) => normalizeProjectPath(entry)))) {
+        const sessionResult = deleteSessions.run(provider, projectPath);
+        deletedSessions += sessionResult.changes;
+        if (sessionResult.changes > 0) {
+          deletedProjects += deleteEmptyProject.run(projectPath).changes;
+        }
+      }
+
+      return { deletedSessions, deletedProjects };
+    });
+
+    return prune();
   },
 
   getSessionName(sessionId: string, provider: string): string | null {

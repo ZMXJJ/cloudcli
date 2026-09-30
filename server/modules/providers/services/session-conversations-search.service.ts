@@ -1,4 +1,4 @@
-import fsSync, { promises as fs } from 'node:fs';
+import fsSync from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
 
@@ -6,6 +6,7 @@ import { spawn } from 'cross-spawn';
 import { rgPath } from '@vscode/ripgrep';
 
 import { projectsDb, sessionsDb } from '@/modules/database/index.js';
+import type { LLMProvider } from '@/shared/types.js';
 
 type AnyRecord = Record<string, any>;
 type SearchableProvider = 'claude' | 'codex';
@@ -50,6 +51,7 @@ type SearchSessionConversationsInput = {
   limit: number;
   signal?: AbortSignal;
   onProgress?: (update: SessionConversationSearchProgressUpdate) => void;
+  providers?: readonly LLMProvider[];
 };
 
 type SessionRepositoryRow = ReturnType<typeof sessionsDb.getAllSessions>[number];
@@ -1068,6 +1070,7 @@ export async function searchConversations(
   limit = 50,
   onProjectResult: ((update: SessionConversationSearchProgressUpdate) => void) | null = null,
   signal: AbortSignal | null = null,
+  providers?: readonly LLMProvider[],
 ): Promise<{ results: ProjectConversationResult[]; totalMatches: number; query: string }> {
   const safeQuery = typeof query === 'string' ? query.trim() : '';
   const safeLimit = Math.max(1, Math.min(Number.isFinite(limit) ? limit : 50, 200));
@@ -1082,7 +1085,7 @@ export async function searchConversations(
     return { results: [], totalMatches: 0, query: safeQuery };
   }
 
-  const searchableSessions = normalizeSearchableSessions(sessionsDb.getAllSessions());
+  const searchableSessions = normalizeSearchableSessions(sessionsDb.getAllSessions(providers));
   if (searchableSessions.length === 0) {
     return { results: [], totalMatches: 0, query: safeQuery };
   }
@@ -1221,6 +1224,7 @@ export const sessionConversationsSearchService = {
       input.limit,
       input.onProgress ?? null,
       input.signal ?? null,
+      input.providers,
     );
   },
 };

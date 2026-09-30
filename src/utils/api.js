@@ -1,5 +1,14 @@
 import { IS_PLATFORM } from "../constants/config";
 
+const withProviderFilter = (path, providers) => {
+  if (!Array.isArray(providers) || providers.length === 0) {
+    return path;
+  }
+
+  const separator = path.includes('?') ? '&' : '?';
+  return `${path}${separator}providers=${encodeURIComponent(providers.join(','))}`;
+};
+
 // Only accept a refreshed token that has this app's issued JWT shape
 // (three base64url segments). An attacker-injected/malformed header value
 // must never overwrite the stored auth token.
@@ -64,12 +73,19 @@ export const api = {
   // config endpoint removed - no longer needed (frontend uses window.location)
   // After the projectName → projectId migration the path/query identifier is
   // the DB-assigned `projectId`; parameter names reflect that for clarity.
-  projects: () => authenticatedFetch('/api/projects'),
-  archivedProjects: () => authenticatedFetch('/api/projects/archived'),
-  projectSessions: (projectId, { limit = 20, offset = 0 } = {}) => {
+  projects: (providers) => authenticatedFetch(withProviderFilter('/api/projects', providers)),
+  archivedProjects: (providers) => authenticatedFetch(withProviderFilter('/api/projects/archived', providers)),
+  /**
+   * @param {string} projectId
+   * @param {{ limit?: number, offset?: number, providers?: string[] }} [options]
+   */
+  projectSessions: (projectId, { limit = 20, offset = 0, providers } = {}) => {
     const params = new URLSearchParams();
     params.set('limit', String(limit));
     params.set('offset', String(offset));
+    if (Array.isArray(providers) && providers.length > 0) {
+      params.set('providers', providers.join(','));
+    }
     return authenticatedFetch(`/api/projects/${encodeURIComponent(projectId)}/sessions?${params.toString()}`);
   },
   projectTaskmaster: (projectId) =>
@@ -107,8 +123,8 @@ export const api = {
       method: 'DELETE',
     });
   },
-  getArchivedSessions: () =>
-    authenticatedFetch('/api/providers/sessions/archived'),
+  getArchivedSessions: (providers) =>
+    authenticatedFetch(withProviderFilter('/api/providers/sessions/archived', providers)),
   runningSessions: () =>
     authenticatedFetch('/api/providers/sessions/running'),
   restoreSession: (sessionId) =>
@@ -129,10 +145,13 @@ export const api = {
       method: 'DELETE',
     });
   },
-  searchConversationsUrl: (query, limit = 50) => {
+  searchConversationsUrl: (query, limit = 50, providers) => {
     const token = localStorage.getItem('auth-token');
     const params = new URLSearchParams({ q: query, limit: String(limit) });
     if (token) params.set('token', token);
+    if (Array.isArray(providers) && providers.length > 0) {
+      params.set('providers', providers.join(','));
+    }
     return `/api/providers/search/sessions?${params.toString()}`;
   },
   createProject: (projectData) =>

@@ -67,6 +67,7 @@ export interface Project {
   fullPath: string;
   path?: string;
   isStarred?: boolean;
+  providerCounts?: Partial<Record<LLMProvider, number>>;
   sessions?: ProjectSession[];
   sessionMeta?: ProjectSessionMeta;
   taskmaster?: ProjectTaskmasterInfo;

@@ -27,6 +27,8 @@ function Sidebar({
   selectedSession,
   activeSessions,
   attentionSessionIds,
+  selectedProviders,
+  onSelectedProvidersChange,
   onProjectSelect,
   onSessionSelect,
   onNewSession,
@@ -117,6 +119,7 @@ function Sidebar({
     selectedProject,
     selectedSession,
     activeSessions,
+    selectedProviders,
     isLoading,
     isMobile,
     t,
@@ -242,6 +245,8 @@ function Sidebar({
             archivedSessions={archivedSessions}
             archivedSessionsCount={archivedSessionsCount}
             isArchivedSessionsLoading={isArchivedSessionsLoading}
+            selectedProviders={selectedProviders}
+            onSelectedProvidersChange={onSelectedProvidersChange}
             searchFilter={searchFilter}
             onSearchFilterChange={setSearchFilter}
             onClearSearchFilter={() => setSearchFilter('')}

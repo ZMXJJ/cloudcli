@@ -2,7 +2,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { readFile } from 'node:fs/promises';
 
-import { sessionsDb } from '@/modules/database/index.js';
+import { projectsDb, sessionsDb } from '@/modules/database/index.js';
+import { isCodexDesktopRecentChatPath } from '@/modules/providers/list/codex/codex-project-path.js';
 import {
   buildLookupMap,
   extractFirstValidJsonlData,
@@ -29,6 +30,8 @@ export class CodexSessionSynchronizer implements IProviderSessionSynchronizer {
    * Scans ~/.codex/sessions and upserts discovered sessions into DB.
    */
   async synchronize(since?: Date): Promise<number> {
+    this.pruneRecentChatIndexes();
+
     const nameMap = await buildLookupMap(path.join(this.codexHome, 'session_index.jsonl'), 'id', 'thread_name');
     const files = await findFilesRecursivelyCreatedAfter(
       path.join(this.codexHome, 'sessions'),
@@ -118,7 +121,11 @@ export class CodexSessionSynchronizer implements IProviderSessionSynchronizer {
       };
     });
 
-    if (!parsed || parsed.isSubagent) {
+    if (
+      !parsed
+      || parsed.isSubagent
+      || isCodexDesktopRecentChatPath(parsed.projectPath)
+    ) {
       return null;
     }
 
@@ -178,6 +185,19 @@ export class CodexSessionSynchronizer implements IProviderSessionSynchronizer {
 
     const source = payload.source;
     return typeof source === 'object' && source !== null && 'subagent' in source;
+  }
+
+  /** Removes previously indexed Desktop recent chats without touching their source files. */
+  private pruneRecentChatIndexes(): void {
+    const projectRows = [
+      ...projectsDb.getProjectPaths(),
+      ...projectsDb.getArchivedProjectPaths(),
+    ];
+    const recentChatPaths = projectRows
+      .map((project) => project.project_path)
+      .filter((projectPath) => isCodexDesktopRecentChatPath(projectPath));
+
+    sessionsDb.pruneProviderSessionsForProjectPaths(this.provider, recentChatPaths);
   }
 
   /**

@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { closeConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
+import { closeConnection, initializeDatabase, projectsDb, sessionsDb } from '@/modules/database/index.js';
+import { isCodexDesktopRecentChatPath } from '@/modules/providers/list/codex/codex-project-path.js';
 import { CodexSessionSynchronizer } from '@/modules/providers/list/codex/codex-session-synchronizer.provider.js';
 
 const patchHomeDir = (nextHomeDir: string) => {
@@ -144,6 +145,90 @@ test('Codex synchronizer leaves indexed sessions untitled when no name is availa
       await synchronizer.synchronize();
 
       assert.equal(sessionsDb.getSessionById('codex-indexed-1')?.custom_name, 'Untitled Codex Session');
+    });
+  } finally {
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('Codex recent-chat path detection only matches generated dated workspaces', () => {
+  const homeDir = path.join(path.sep, 'Users', 'demo');
+
+  assert.equal(
+    isCodexDesktopRecentChatPath(
+      path.join(homeDir, 'Documents', 'Codex', '2026-07-27', 'new-chat'),
+      homeDir,
+    ),
+    true,
+  );
+  assert.equal(
+    isCodexDesktopRecentChatPath(
+      path.join(homeDir, 'Documents', 'Codex', '2026-07-27', 'chat', 'nested'),
+      homeDir,
+    ),
+    true,
+  );
+  assert.equal(
+    isCodexDesktopRecentChatPath(
+      path.join(homeDir, 'Documents', 'Codex', 'my-project'),
+      homeDir,
+    ),
+    false,
+  );
+  assert.equal(
+    isCodexDesktopRecentChatPath(
+      path.join(homeDir, 'Documents', 'Codex', '2026-07-27'),
+      homeDir,
+    ),
+    false,
+  );
+  assert.equal(
+    isCodexDesktopRecentChatPath(path.join(homeDir, 'CodePrograms', 'project'), homeDir),
+    false,
+  );
+});
+
+test('Codex synchronizer skips and prunes Desktop recent chats without deleting transcripts', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-session-sync-recent-'));
+  const generatedPath = path.join(tempRoot, 'Documents', 'Codex', '2026-07-27', 'new-chat');
+  const mixedProviderPath = path.join(tempRoot, 'Documents', 'Codex', '2026-07-28', 'mixed-chat');
+  const similarProjectPath = path.join(tempRoot, 'Documents', 'Codex', 'not-a-date', 'real-project');
+  const regularProjectPath = path.join(tempRoot, 'CodePrograms', 'real-project');
+  const restoreHomeDir = patchHomeDir(tempRoot);
+
+  try {
+    const generatedTranscript = await writeCodexTranscript(
+      tempRoot,
+      'codex-generated-new',
+      generatedPath,
+    );
+    await writeCodexTranscript(tempRoot, 'codex-regular', regularProjectPath);
+    await writeCodexTranscript(tempRoot, 'codex-similar', similarProjectPath);
+
+    await withIsolatedDatabase(async () => {
+      sessionsDb.createSession('codex-generated-old', 'codex', generatedPath);
+      sessionsDb.createSession('codex-mixed-old', 'codex', mixedProviderPath);
+      sessionsDb.createSession('claude-mixed', 'claude', mixedProviderPath);
+
+      const synchronizer = new CodexSessionSynchronizer();
+      const processed = await synchronizer.synchronize();
+
+      assert.equal(processed, 2);
+      assert.equal(sessionsDb.getSessionById('codex-generated-new'), null);
+      assert.equal(sessionsDb.getSessionById('codex-generated-old'), null);
+      assert.equal(projectsDb.getProjectPath(generatedPath), null);
+
+      assert.equal(sessionsDb.getSessionById('codex-mixed-old'), null);
+      assert.ok(sessionsDb.getSessionById('claude-mixed'));
+      assert.ok(projectsDb.getProjectPath(mixedProviderPath));
+
+      assert.ok(sessionsDb.getSessionById('codex-regular'));
+      assert.ok(sessionsDb.getSessionById('codex-similar'));
+      await access(generatedTranscript);
+
+      assert.equal(await synchronizer.synchronizeFile(generatedTranscript), null);
+      assert.equal(sessionsDb.getSessionById('codex-generated-new'), null);
     });
   } finally {
     restoreHomeDir();

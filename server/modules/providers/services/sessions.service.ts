@@ -194,8 +194,8 @@ export const sessionsService = {
    * Returns archived sessions with enough project metadata for the sidebar to
    * group, filter, open, and restore them without a per-row follow-up query.
    */
-  listArchivedSessions(): ArchivedSessionListItem[] {
-    const archivedSessions = sessionsDb.getArchivedSessions();
+  listArchivedSessions(providers?: readonly LLMProvider[]): ArchivedSessionListItem[] {
+    const archivedSessions = sessionsDb.getArchivedSessions(providers);
     const projectCache = new Map<string, ReturnType<typeof projectsDb.getProjectPath>>();
 
     return archivedSessions.map((session) => {

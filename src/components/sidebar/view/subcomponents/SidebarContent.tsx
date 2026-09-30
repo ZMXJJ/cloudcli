@@ -3,7 +3,7 @@ import { Activity, Archive, Folder, MessageSquare, RotateCcw, Search, Trash2 } f
 import type { TFunction } from 'i18next';
 
 import { ScrollArea } from '../../../../shared/view/ui';
-import type { Project } from '../../../../types/app';
+import type { LLMProvider, Project } from '../../../../types/app';
 import type { ReleaseInfo } from '../../../../types/sharedTypes';
 import type { ConversationSearchResults, SearchProgress } from '../../hooks/useSidebarController';
 import type { ArchivedProjectListItem, ArchivedSessionListItem, SidebarSearchMode } from '../../types/types';
@@ -121,6 +121,8 @@ type SidebarContentProps = {
   archivedSessions: ArchivedSessionListItem[];
   archivedSessionsCount: number;
   isArchivedSessionsLoading: boolean;
+  selectedProviders: readonly LLMProvider[];
+  onSelectedProvidersChange: (providers: LLMProvider[]) => void;
   searchFilter: string;
   onSearchFilterChange: (value: string) => void;
   onClearSearchFilter: () => void;
@@ -161,6 +163,8 @@ export default function SidebarContent({
   archivedSessions,
   archivedSessionsCount,
   isArchivedSessionsLoading,
+  selectedProviders,
+  onSelectedProvidersChange,
   searchFilter,
   onSearchFilterChange,
   onClearSearchFilter,
@@ -205,6 +209,8 @@ export default function SidebarContent({
         runningSessionsCount={runningSessionsCount}
         archivedSessionsCount={archivedSessionsCount}
         isArchivedSessionsLoading={isArchivedSessionsLoading}
+        selectedProviders={selectedProviders}
+        onSelectedProvidersChange={onSelectedProvidersChange}
         searchFilter={searchFilter}
         onSearchFilterChange={onSearchFilterChange}
         onClearSearchFilter={onClearSearchFilter}

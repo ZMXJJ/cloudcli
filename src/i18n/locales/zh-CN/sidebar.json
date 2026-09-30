@@ -131,6 +131,17 @@
     "projectsScanned_one": "{{count}} 个项目已扫描",
     "projectsScanned_other": "{{count}} 个项目已扫描"
   },
+  "providerFilter": {
+    "title": "筛选提供商",
+    "selectAll": "全选",
+    "minimumOne": "至少保留一个提供商。",
+    "providers": {
+      "claude": "Claude Code",
+      "codex": "Codex",
+      "cursor": "Cursor",
+      "opencode": "OpenCode"
+    }
+  },
   "deleteConfirmation": {
     "deleteProject": "移除项目",
     "deleteSession": "删除会话",

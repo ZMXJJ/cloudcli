@@ -43,6 +43,8 @@ export type SidebarProps = {
   selectedSession: ProjectSession | null;
   activeSessions: SessionActivityMap;
   attentionSessionIds: ReadonlySet<string>;
+  selectedProviders: readonly LLMProvider[];
+  onSelectedProvidersChange: (providers: LLMProvider[]) => void;
   onProjectSelect: (project: Project) => void;
   onSessionSelect: (session: ProjectSession) => void;
   onNewSession: (project: Project) => void;

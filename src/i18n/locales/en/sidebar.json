@@ -131,6 +131,17 @@
     "projectsScanned_one": "{{count}} project scanned",
     "projectsScanned_other": "{{count}} projects scanned"
   },
+  "providerFilter": {
+    "title": "Filter providers",
+    "selectAll": "Select all",
+    "minimumOne": "Keep at least one provider selected.",
+    "providers": {
+      "claude": "Claude Code",
+      "codex": "Codex",
+      "cursor": "Cursor",
+      "opencode": "OpenCode"
+    }
+  },
   "deleteConfirmation": {
     "deleteProject": "Remove Project",
     "deleteSession": "Delete Session",

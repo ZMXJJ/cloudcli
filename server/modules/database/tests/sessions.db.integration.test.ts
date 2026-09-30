@@ -82,3 +82,31 @@ test('repository reads normalize SQLite UTC timestamps to ISO strings', async ()
     assert.match(row?.updated_at ?? '', /^\d{4}-\d{2}-\d{2}T/);
   });
 });
+
+test('project session pagination and archive queries filter by provider', async () => {
+  await withIsolatedDatabase(() => {
+    sessionsDb.createSession('claude-active', 'claude', '/workspace/mixed-project', 'Claude');
+    sessionsDb.createSession('codex-active', 'codex', '/workspace/mixed-project', 'Codex');
+    sessionsDb.createSession('cursor-active', 'cursor', '/workspace/mixed-project', 'Cursor');
+    sessionsDb.createSession('codex-archived', 'codex', '/workspace/mixed-project', 'Old Codex');
+    sessionsDb.updateSessionIsArchived('codex-archived', true);
+
+    const codexPage = sessionsDb.getSessionsByProjectPathPage(
+      '/workspace/mixed-project',
+      20,
+      0,
+      ['codex'],
+    );
+    const selectedCount = sessionsDb.countSessionsByProjectPath(
+      '/workspace/mixed-project',
+      ['claude', 'codex'],
+    );
+    const archivedCodex = sessionsDb.getArchivedSessions(['codex']);
+    const providerCounts = sessionsDb.getProviderCountsByProjectPath('/workspace/mixed-project');
+
+    assert.deepEqual(codexPage.map((session) => session.session_id), ['codex-active']);
+    assert.equal(selectedCount, 2);
+    assert.deepEqual(archivedCodex.map((session) => session.session_id), ['codex-archived']);
+    assert.deepEqual(providerCounts, { claude: 1, codex: 1, cursor: 1 });
+  });
+});

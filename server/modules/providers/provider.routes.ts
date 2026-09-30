@@ -16,7 +16,7 @@ import type {
   ProviderSkillCreateInput,
   UpsertProviderMcpServerInput,
 } from '@/shared/types.js';
-import { AppError, asyncHandler, createApiSuccessResponse } from '@/shared/utils.js';
+import { AppError, asyncHandler, createApiSuccessResponse, parseProviderFilter } from '@/shared/utils.js';
 
 const router = express.Router();
 
@@ -550,8 +550,8 @@ router.get(
 
 router.get(
   '/sessions/archived',
-  asyncHandler(async (_req: Request, res: Response) => {
-    const sessions = sessionsService.listArchivedSessions();
+  asyncHandler(async (req: Request, res: Response) => {
+    const sessions = sessionsService.listArchivedSessions(parseProviderFilter(req.query.providers));
     res.json(createApiSuccessResponse({ sessions }));
   }),
 );
@@ -631,6 +631,7 @@ router.get(
 router.get('/search/sessions', asyncHandler(async (req: Request, res: Response) => {
   const query = parseSessionSearchQuery(req.query.q);
   const limit = parseSessionSearchLimit(req.query.limit);
+  const providers = parseProviderFilter(req.query.providers);
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -650,6 +651,7 @@ router.get('/search/sessions', asyncHandler(async (req: Request, res: Response) 
     await sessionConversationsSearchService.search({
       query,
       limit,
+      providers,
       signal: abortController.signal,
       onProgress: ({ projectResult, totalMatches, scannedProjects, totalProjects }) => {
         if (closed) {

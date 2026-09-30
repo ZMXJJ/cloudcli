@@ -2,6 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { NavigateFunction } from 'react-router-dom';
 
 import { api } from '../utils/api';
+import {
+  getProviderApiFilter,
+  isProviderSelected,
+  readProviderFilter,
+  writeProviderFilter,
+} from '../utils/providerFilter';
 import type { ServerEvent } from '../contexts/WebSocketContext';
 import type {
   AppTab,
@@ -357,6 +363,7 @@ export function useProjectsState({
   activeSessions,
 }: UseProjectsStateArgs) {
   const [projects, setProjects] = useState<Project[]>([]);
+  const [selectedProviders, setSelectedProviders] = useState<LLMProvider[]>(readProviderFilter);
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
   const [selectedSession, setSelectedSession] = useState<ProjectSession | null>(null);
   const [attentionSessionIds, setAttentionSessionIds] = useState<Set<string>>(new Set());
@@ -412,6 +419,14 @@ export function useProjectsState({
   selectedSessionRef.current = selectedSession;
   const activeSessionsRef = useRef(activeSessions);
   activeSessionsRef.current = activeSessions;
+  const selectedProvidersRef = useRef(selectedProviders);
+  selectedProvidersRef.current = selectedProviders;
+  const projectsFetchSequenceRef = useRef(0);
+  const appliedProviderFilterRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    writeProviderFilter(selectedProviders);
+  }, [selectedProviders]);
 
   const markSessionAttention = useCallback((targetSessionId?: string | null) => {
     if (!targetSessionId) {
@@ -451,16 +466,27 @@ export function useProjectsState({
   }, []);
 
   const fetchProjects = useCallback(async ({ showLoadingState = true }: FetchProjectsOptions = {}) => {
+    const requestSequence = ++projectsFetchSequenceRef.current;
+    const providerFilter = getProviderApiFilter(selectedProviders);
+    const providerFilterKey = selectedProviders.join(',');
     try {
       if (showLoadingState) {
         setIsLoadingProjects(true);
       }
-      const response = await api.projects();
+      const response = await api.projects(providerFilter);
       const projectData = (await response.json()) as Project[];
+
+      if (requestSequence !== projectsFetchSequenceRef.current) {
+        return;
+      }
 
       setProjects((prevProjects) => {
         const projectsWithTaskMaster = mergeTaskMasterCache(projectData, prevProjects);
-        const mergedProjects = mergeExpandedSessionPages(prevProjects, projectsWithTaskMaster);
+        const filterChanged = appliedProviderFilterRef.current !== providerFilterKey;
+        const mergedProjects = filterChanged
+          ? projectsWithTaskMaster
+          : mergeExpandedSessionPages(prevProjects, projectsWithTaskMaster);
+        appliedProviderFilterRef.current = providerFilterKey;
 
         if (prevProjects.length === 0) {
           return mergedProjects;
@@ -477,7 +503,7 @@ export function useProjectsState({
         setIsLoadingProjects(false);
       }
     }
-  }, []);
+  }, [selectedProviders]);
 
   const refreshProjectsSilently = useCallback(async () => {
     // Keep chat view stable while still syncing sidebar/session metadata in background.
@@ -521,21 +547,23 @@ export function useProjectsState({
       timestamp: now,
     };
 
-    setProjects((previousProjects) => {
-      const existingProject = previousProjects.find((candidate) => candidate.projectId === project.projectId);
-      if (!existingProject) {
-        return [upsertSessionIntoProject(projectFromRegistration(project), upsert), ...previousProjects];
-      }
+    if (isProviderSelected(selectedProvidersRef.current, provider)) {
+      setProjects((previousProjects) => {
+        const existingProject = previousProjects.find((candidate) => candidate.projectId === project.projectId);
+        if (!existingProject) {
+          return [upsertSessionIntoProject(projectFromRegistration(project), upsert), ...previousProjects];
+        }
 
-      const updatedProject = upsertSessionIntoProject(existingProject, upsert);
-      if (updatedProject === existingProject) {
-        return previousProjects;
-      }
+        const updatedProject = upsertSessionIntoProject(existingProject, upsert);
+        if (updatedProject === existingProject) {
+          return previousProjects;
+        }
 
-      return previousProjects.map((candidate) =>
-        candidate.projectId === existingProject.projectId ? updatedProject : candidate,
-      );
-    });
+        return previousProjects.map((candidate) =>
+          candidate.projectId === existingProject.projectId ? updatedProject : candidate,
+        );
+      });
+    }
 
     setSelectedProject((previousProject) => {
       if (!previousProject || previousProject.projectId !== project.projectId) {
@@ -683,6 +711,10 @@ export function useProjectsState({
         setExternalMessageUpdate((prev) => prev + 1);
       } else {
         markSessionAttention(upsert.sessionId);
+      }
+
+      if (!isProviderSelected(selectedProvidersRef.current, upsert.provider)) {
+        return;
       }
 
       setProjects((previousProjects) => {
@@ -967,6 +999,7 @@ export function useProjectsState({
     const response = await api.projectSessions(projectId, {
       limit: 20,
       offset: loadedCount,
+      providers: getProviderApiFilter(selectedProviders),
     });
 
     if (!response.ok) {
@@ -999,7 +1032,7 @@ export function useProjectsState({
     if (selectedProject?.projectId === projectId && mergedProjectForSelection) {
       setSelectedProject(mergedProjectForSelection);
     }
-  }, [projects, selectedProject?.projectId]);
+  }, [projects, selectedProject?.projectId, selectedProviders]);
 
   // `projectId` is the DB identifier passed from the sidebar's delete flow
   // after the migration away from folder-derived project names.
@@ -1023,6 +1056,8 @@ export function useProjectsState({
       selectedSession,
       activeSessions,
       attentionSessionIds,
+      selectedProviders,
+      onSelectedProvidersChange: setSelectedProviders,
       onProjectSelect: handleProjectSelect,
       onSessionSelect: handleSessionSelect,
       onNewSession: handleNewSession,
@@ -1040,6 +1075,7 @@ export function useProjectsState({
     }),
     [
       attentionSessionIds,
+      selectedProviders,
       handleNewSession,
       handleProjectDelete,
       handleProjectSelect,
